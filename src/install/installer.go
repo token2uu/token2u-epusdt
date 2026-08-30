@@ -295,6 +295,7 @@ type envTemplateData struct {
 func writeEnvFile(path string, r *InstallRequest, installEnabled bool) error {
 	// Collect existing non-empty key→value pairs for non-form keys.
 	existingValues := map[string]string{}
+	existingOrder := make([]string, 0)
 	if data, err := os.ReadFile(path); err == nil {
 		for _, line := range strings.Split(string(data), "\n") {
 			line = strings.TrimSpace(line)
@@ -305,6 +306,9 @@ func writeEnvFile(path string, r *InstallRequest, installEnabled bool) error {
 				k := strings.TrimSpace(line[:idx])
 				v := strings.TrimSpace(line[idx+1:])
 				if v != "" && !formControlledKeys[k] {
+					if _, exists := existingValues[k]; !exists {
+						existingOrder = append(existingOrder, k)
+					}
 					existingValues[k] = v
 				}
 			}
@@ -331,6 +335,7 @@ func writeEnvFile(path string, r *InstallRequest, installEnabled bool) error {
 	// For non-form keys that already had a value, substitute the existing value
 	// so the template default does not clobber operator configuration.
 	lines := strings.Split(buf.String(), "\n")
+	renderedKeys := make(map[string]bool)
 	for i, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
@@ -338,9 +343,18 @@ func writeEnvFile(path string, r *InstallRequest, installEnabled bool) error {
 		}
 		if idx := strings.IndexByte(trimmed, '='); idx >= 0 {
 			k := strings.TrimSpace(trimmed[:idx])
+			renderedKeys[k] = true
 			if existing, ok := existingValues[k]; ok {
 				lines[i] = k + "=" + existing
 			}
+		}
+	}
+	// Preserve operator-specific keys that are not part of the built-in
+	// template at all (for example postgres_*). Without this, a successful
+	// install rewrites the file and silently drops the database connection.
+	for _, k := range existingOrder {
+		if !renderedKeys[k] {
+			lines = append(lines, k+"="+existingValues[k])
 		}
 	}
 

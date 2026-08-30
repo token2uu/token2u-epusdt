@@ -148,6 +148,59 @@ func TestWriteEnvFile(t *testing.T) {
 	}
 }
 
+func TestWriteEnvFilePreservesPostgresConfiguration(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, ".env")
+	existing := `app_name=old
+app_uri=http://old.example
+db_type=postgres
+postgres_host=db.internal
+postgres_port=5411
+postgres_user=epusdt
+postgres_passwd=secret-value
+postgres_database=epusdt
+install=true
+`
+	if err := os.WriteFile(path, []byte(existing), 0o600); err != nil {
+		t.Fatalf("write existing env: %v", err)
+	}
+
+	req := &InstallRequest{
+		AppName:             "new-app",
+		AppURI:              "http://1.2.3.4:8099",
+		HttpBindAddr:        "0.0.0.0",
+		HttpBindPort:        8000,
+		RuntimeRootPath:     "/app/runtime",
+		LogSavePath:         "/app/logs",
+		OrderExpirationTime: 10,
+		OrderNoticeMaxRetry: 1,
+	}
+	if err := writeEnvFile(path, req, false); err != nil {
+		t.Fatalf("writeEnvFile: %v", err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read env: %v", err)
+	}
+	content := string(data)
+	for _, want := range []string{
+		"app_name=new-app",
+		"app_uri=http://1.2.3.4:8099",
+		"db_type=postgres",
+		"postgres_host=db.internal",
+		"postgres_port=5411",
+		"postgres_user=epusdt",
+		"postgres_passwd=secret-value",
+		"postgres_database=epusdt",
+		"install=false",
+	} {
+		if !strings.Contains(content, want) {
+			t.Errorf("env file missing %q\ncontent:\n%s", want, content)
+		}
+	}
+}
+
 func TestInstallAPIDefaults(t *testing.T) {
 	h := &installHandler{done: make(chan struct{})}
 	e := echo.New()

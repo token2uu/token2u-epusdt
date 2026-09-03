@@ -198,7 +198,7 @@ func (c *BaseAdminController) ResendCallback(ctx echo.Context) error {
 		log.Sugar.Warnf("[admin-order] resend-callback rejected admin_user_id=%d trade_id=%s err=%v", adminUserID, tradeID, err)
 		return c.FailJson(ctx, err)
 	}
-	if order.Status != mdb.StatusPaySuccess && order.Status != mdb.StatusExpired {
+	if order.Status != mdb.StatusPaySuccess {
 		err = constant.OrderCallbackNotApplicable
 		log.Sugar.Warnf("[admin-order] resend-callback rejected admin_user_id=%d trade_id=%s status=%d err=%v", adminUserID, tradeID, order.Status, err)
 		return c.FailJson(ctx, err)

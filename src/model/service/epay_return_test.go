@@ -122,6 +122,43 @@ func TestBuildEPayResultParamsRejectsNonNumericPid(t *testing.T) {
 	}
 }
 
+func TestBuildEPayResultParamsExpiredOrderReturnsTradeClosed(t *testing.T) {
+	params, err := BuildEPayResultParams(&mdb.Orders{
+		TradeId:  "trade_epay_expired",
+		OrderId:  "order_epay_expired",
+		Name:     "VIP",
+		Amount:   1,
+		EpayType: "usdt",
+		Status:   mdb.StatusExpired,
+	}, &mdb.ApiKey{
+		Pid:       "1001",
+		SecretKey: "epay-secret",
+	})
+	if err != nil {
+		t.Fatalf("BuildEPayResultParams(): %v", err)
+	}
+	if got := params["trade_status"]; got != "TRADE_CLOSED" {
+		t.Fatalf("trade_status = %q, want TRADE_CLOSED", got)
+	}
+
+	signParams := map[string]interface{}{
+		"pid":          params["pid"],
+		"trade_no":     params["trade_no"],
+		"out_trade_no": params["out_trade_no"],
+		"type":         params["type"],
+		"name":         params["name"],
+		"money":        params["money"],
+		"trade_status": params["trade_status"],
+	}
+	wantSign, err := sign.Get(signParams, "epay-secret")
+	if err != nil {
+		t.Fatalf("sign.Get(): %v", err)
+	}
+	if got := params["sign"]; got != wantSign {
+		t.Fatalf("sign = %q, want %q", got, wantSign)
+	}
+}
+
 func TestResolveOrderApiKeyRejectsUnavailableRows(t *testing.T) {
 	cleanup := testutil.SetupTestDatabases(t)
 	defer cleanup()

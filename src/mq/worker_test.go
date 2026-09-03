@@ -762,6 +762,250 @@ func TestDispatchPendingCallbacksEpayAcceptsSuccessAck(t *testing.T) {
 	}
 }
 
+func TestSendOrderCallbackEpayExpiredSendsTradeClosed(t *testing.T) {
+	cleanup := testutil.SetupTestDatabases(t)
+	defer cleanup()
+
+	key := &mdb.ApiKey{
+		Name:      "epay-key-expired",
+		Pid:       "9301",
+		SecretKey: "epay-secret-9301",
+		Status:    mdb.ApiKeyStatusEnable,
+	}
+	if err := dao.Mdb.Create(key).Error; err != nil {
+		t.Fatalf("create api key: %v", err)
+	}
+
+	formPayload := map[string]string{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := r.ParseForm(); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		for k, v := range r.Form {
+			if len(v) > 0 {
+				formPayload[k] = v[0]
+			}
+		}
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer server.Close()
+
+	order := &mdb.Orders{
+		TradeId:     "trade_epay_expired",
+		OrderId:     "order_epay_expired",
+		Amount:      1,
+		Currency:    "CNY",
+		Name:        "VIP",
+		Status:      mdb.StatusExpired,
+		NotifyUrl:   server.URL,
+		EpayType:    "usdt",
+		PaymentType: mdb.PaymentTypeEpay,
+		ApiKeyID:    key.ID,
+	}
+
+	if err := sendOrderCallback(order); err != nil {
+		t.Fatalf("send epay expired callback: %v", err)
+	}
+
+	if formPayload["trade_status"] != "TRADE_CLOSED" {
+		t.Fatalf("trade_status = %q, want TRADE_CLOSED", formPayload["trade_status"])
+	}
+
+	signParams := map[string]interface{}{
+		"pid":          formPayload["pid"],
+		"trade_no":     formPayload["trade_no"],
+		"out_trade_no": formPayload["out_trade_no"],
+		"type":         formPayload["type"],
+		"name":         formPayload["name"],
+		"money":        formPayload["money"],
+		"trade_status": formPayload["trade_status"],
+	}
+	calcSig, err := sign.Get(signParams, key.SecretKey)
+	if err != nil {
+		t.Fatalf("calc epay signature: %v", err)
+	}
+	if got := formPayload["sign"]; got != calcSig {
+		t.Fatalf("sign = %q, want %q", got, calcSig)
+	}
+}
+
+func TestSendOrderCallbackGmpayExpiredSendsStatus3(t *testing.T) {
+	cleanup := testutil.SetupTestDatabases(t)
+	defer cleanup()
+
+	key := &mdb.ApiKey{
+		Name:      "gmpay-key-expired",
+		Pid:       "9401",
+		SecretKey: "gmpay-secret-9401",
+		Status:    mdb.ApiKeyStatusEnable,
+	}
+	if err := dao.Mdb.Create(key).Error; err != nil {
+		t.Fatalf("create api key: %v", err)
+	}
+
+	var receivedBody map[string]interface{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&receivedBody); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer server.Close()
+
+	order := &mdb.Orders{
+		TradeId:        "trade_gmpay_expired",
+		OrderId:        "order_gmpay_expired",
+		Amount:         1,
+		Currency:       "CNY",
+		ActualAmount:   1,
+		ReceiveAddress: "wallet_gmpay_expired",
+		Token:          "USDT",
+		Status:         mdb.StatusExpired,
+		NotifyUrl:      server.URL,
+		PaymentType:    mdb.PaymentTypeGmpay,
+		ApiKeyID:       key.ID,
+	}
+
+	if err := sendOrderCallback(order); err != nil {
+		t.Fatalf("send gmpay expired callback: %v", err)
+	}
+
+	status, ok := receivedBody["status"].(float64)
+	if !ok {
+		t.Fatalf("status not found or not a number in response body")
+	}
+	if int(status) != mdb.StatusExpired {
+		t.Fatalf("status = %v, want %d", status, mdb.StatusExpired)
+	}
+}
+
+func TestExpiredOrderCallbackEndToEnd(t *testing.T) {
+	cleanup := testutil.SetupTestDatabases(t)
+	defer cleanup()
+
+	callbackLimiter = make(chan struct{}, 1)
+	callbackInflight = sync.Map{}
+
+	var requestCount int32
+	var receivedTradeStatus string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requestCount, 1)
+		if err := r.ParseForm(); err == nil {
+			receivedTradeStatus = r.FormValue("trade_status")
+		}
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer server.Close()
+
+	epayKey, err := data.GetEnabledApiKey("1001")
+	if err != nil || epayKey == nil || epayKey.ID == 0 {
+		t.Fatalf("load epay key: %v", err)
+	}
+
+	order := &mdb.Orders{
+		TradeId:     "trade_e2e_expired",
+		OrderId:     "order_e2e_expired",
+		Amount:      1,
+		Currency:    "CNY",
+		ActualAmount: 1,
+		ReceiveAddress: "wallet_e2e_expired",
+		Token:       "USDT",
+		Network:     "tron",
+		Status:      mdb.StatusWaitPay,
+		NotifyUrl:   server.URL,
+		PaymentType: mdb.PaymentTypeEpay,
+		ApiKeyID:    epayKey.ID,
+	}
+	if err := dao.Mdb.Create(order).Error; err != nil {
+		t.Fatalf("create order: %v", err)
+	}
+	if err := dao.Mdb.Model(order).UpdateColumn("created_at", time.Now().Add(-20*time.Minute)).Error; err != nil {
+		t.Fatalf("age order: %v", err)
+	}
+
+	processExpiredOrders()
+
+	expired, err := data.GetOrderInfoByTradeId(order.TradeId)
+	if err != nil {
+		t.Fatalf("reload expired order: %v", err)
+	}
+	if expired.Status != mdb.StatusExpired {
+		t.Fatalf("status = %d, want %d", expired.Status, mdb.StatusExpired)
+	}
+	if expired.CallBackConfirm != mdb.CallBackConfirmNo {
+		t.Fatalf("callback_confirm = %d, want %d", expired.CallBackConfirm, mdb.CallBackConfirmNo)
+	}
+
+	dispatchPendingCallbacks()
+
+	waitFor(t, 3*time.Second, func() bool {
+		current, innerErr := data.GetOrderInfoByTradeId(order.TradeId)
+		if innerErr != nil || current.ID <= 0 {
+			return false
+		}
+		return current.CallBackConfirm == mdb.CallBackConfirmOk
+	})
+
+	if got := atomic.LoadInt32(&requestCount); got != 1 {
+		t.Fatalf("callback request count = %d, want 1", got)
+	}
+	if receivedTradeStatus != "TRADE_CLOSED" {
+		t.Fatalf("trade_status = %q, want TRADE_CLOSED", receivedTradeStatus)
+	}
+}
+
+func TestPlaceholderExpiredOrderDoesNotTriggerCallback(t *testing.T) {
+	cleanup := testutil.SetupTestDatabases(t)
+	defer cleanup()
+
+	callbackLimiter = make(chan struct{}, 1)
+	callbackInflight = sync.Map{}
+
+	var requestCount int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&requestCount, 1)
+		_, _ = io.WriteString(w, "ok")
+	}))
+	defer server.Close()
+
+	placeholder := &mdb.Orders{
+		TradeId:   "trade_placeholder_no_callback",
+		OrderId:   "order_placeholder_no_callback",
+		Amount:    1,
+		Currency:  "CNY",
+		Status:    mdb.StatusWaitSelect,
+		NotifyUrl: server.URL,
+	}
+	if err := dao.Mdb.Create(placeholder).Error; err != nil {
+		t.Fatalf("create placeholder: %v", err)
+	}
+	if err := dao.Mdb.Model(placeholder).UpdateColumn("created_at", time.Now().Add(-20*time.Minute)).Error; err != nil {
+		t.Fatalf("age placeholder: %v", err)
+	}
+
+	processExpiredOrders()
+
+	expired, err := data.GetOrderInfoByTradeId(placeholder.TradeId)
+	if err != nil {
+		t.Fatalf("reload expired placeholder: %v", err)
+	}
+	if expired.Status != mdb.StatusExpired {
+		t.Fatalf("status = %d, want %d", expired.Status, mdb.StatusExpired)
+	}
+	if expired.CallBackConfirm != mdb.CallBackConfirmNo {
+		t.Fatalf("callback_confirm = %d, want %d (DB default, filtered by notify_url check)", expired.CallBackConfirm, mdb.CallBackConfirmNo)
+	}
+
+	dispatchPendingCallbacks()
+	time.Sleep(200 * time.Millisecond)
+
+	if got := atomic.LoadInt32(&requestCount); got != 0 {
+		t.Fatalf("callback request count = %d, want 0 (placeholder should not trigger callback)", got)
+	}
+}
+
 func waitFor(t *testing.T, timeout time.Duration, fn func() bool) {
 	t.Helper()
 

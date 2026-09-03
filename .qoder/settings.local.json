@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find /Users/hyd/project/token2u-epusdt -type f -name \"*.go\" | head -80)",
+      "Bash(find /Users/hyd/project/token2u-epusdt -type f -name \"*.java\" | head -80)",
+      "Bash(cp:*)"
+    ]
+  }
+}

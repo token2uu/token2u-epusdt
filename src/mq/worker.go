@@ -226,6 +226,7 @@ func sendOrderCallback(order *mdb.Orders) error {
 			OrderId:            order.OrderId,
 			Amount:             order.Amount,
 			ActualAmount:       order.ActualAmount,
+			PaidAmount:         order.PaidAmount,
 			ReceiveAddress:     order.ReceiveAddress,
 			Token:              order.Token,
 			BlockTransactionId: order.BlockTransactionId,

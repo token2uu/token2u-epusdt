@@ -21,6 +21,7 @@ type OrderNotifyResponse struct {
 	OrderId            string  `json:"order_id" example:"ORD20260416001"`                                                    //  客户交易id
 	Amount             float64 `json:"amount" example:"100.0000"`                                                            //  订单金额，按 system.amount_precision 保留小数
 	ActualAmount       float64 `json:"actual_amount" example:"14.2857"`                                                      //  订单实际需要支付的金额，按 system.amount_precision 保留小数
+	PaidAmount         float64 `json:"paid_amount,omitempty" example:"70.02"`                                                //  实际支付对应的法币金额，仅在金额不匹配时返回
 	ReceiveAddress     string  `json:"receive_address" example:"TTestTronAddress001"`                                        //  收款钱包地址
 	Token              string  `json:"token" example:"USDT"`                                                                 // 所属币种 TRX USDT......
 	BlockTransactionId string  `json:"block_transaction_id" example:"0xabc123..."`                                           // 区块id
@@ -37,6 +38,7 @@ type OrderNotifyResponseEpay struct {
 	Type        string `json:"type" example:"usdt"`                         // 订单类型
 	Name        string `json:"name" example:"VIP月卡"`                        // 商品名称
 	Money       string `json:"money" example:"100.0000"`                    // 订单金额，保留4位小数
+	PaidMoney   string `json:"paid_money,omitempty" example:"70.0200"`      // 实际支付对应的法币金额，仅在金额不匹配时返回
 	Sign        string `json:"sign" example:"a1b2c3d4..."`                  // 签名
 	SignType    string `json:"sign_type" example:"MD5"`                     // 签名类型
 	TradeStatus string `json:"trade_status" example:"TRADE_SUCCESS"`        // 订单状态

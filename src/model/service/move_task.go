@@ -52,12 +52,13 @@ func ProcessMoveObservedTransferResult(transfer MoveObservedTransfer) error {
 		return nil
 	}
 
-	tradeID, err := data.GetTradeIdByWalletAddressAndAmountAndToken(transfer.Network, transfer.ReceiveAddress, transfer.Token, transfer.Amount)
+	matchResult, err := data.GetTradeIdByWalletAddressAndAmountAndTokenWithEpayFallback(transfer.Network, transfer.ReceiveAddress, transfer.Token, transfer.Amount)
 	if err != nil {
 		clearCache()
 		log.Sugar.Errorf("[%s-%s][%s] lock lookup failed tx=%s: %v", net, transfer.Token, transfer.ReceiveAddress, transfer.TxID, err)
 		return err
 	}
+	tradeID := matchResult.TradeId
 	if tradeID == "" {
 		raw := ""
 		if transfer.RawAmount != nil {
@@ -65,6 +66,9 @@ func ProcessMoveObservedTransferResult(transfer MoveObservedTransfer) error {
 		}
 		log.Sugar.Infof("[%s-%s][%s] skip unmatched tx=%s amount=%.8f raw=%s decimals=%d", net, transfer.Token, transfer.ReceiveAddress, transfer.TxID, transfer.Amount, raw, transfer.Decimals)
 		return nil
+	}
+	if matchResult.IsEpayFallback {
+		log.Sugar.Infof("[%s-%s][%s] epay fallback match trade_id=%s expected_amount!=%.8f", net, transfer.Token, transfer.ReceiveAddress, tradeID, transfer.Amount)
 	}
 	order, err := data.GetOrderInfoByTradeId(tradeID)
 	if err != nil {
@@ -83,6 +87,9 @@ func ProcessMoveObservedTransferResult(transfer MoveObservedTransfer) error {
 		TradeId:            tradeID,
 		Amount:             transfer.Amount,
 		BlockTransactionId: transfer.TxID,
+	}
+	if matchResult.IsEpayFallback {
+		req.PaidAmount = transfer.Amount
 	}
 	if err = processMoveOrder(req); err != nil {
 		if errors.Is(err, constant.OrderBlockAlreadyProcess) || errors.Is(err, constant.OrderStatusConflict) {
@@ -144,7 +151,7 @@ func EnsureMoveTransferMatchesOrder(order *mdb.Orders, transfer MoveObservedTran
 		return fmt.Errorf("transaction predates the order")
 	}
 	if !amountMatchesRaw(order.ActualAmount, transfer.RawAmount, transfer.Decimals) {
-		return fmt.Errorf("transaction amount mismatch")
+		return &AmountMismatchError{ActualPaidAmount: rawAmountToFloat(transfer.RawAmount, transfer.Decimals)}
 	}
 	return nil
 }

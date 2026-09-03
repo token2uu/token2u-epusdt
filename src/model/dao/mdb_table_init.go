@@ -181,6 +181,7 @@ func seedDefaultSettings() {
 		{Group: mdb.SettingGroupEpay, Key: mdb.SettingKeyEpayDefaultToken, Value: "", Type: mdb.SettingTypeString},
 		{Group: mdb.SettingGroupEpay, Key: mdb.SettingKeyEpayDefaultCurrency, Value: "cny", Type: mdb.SettingTypeString},
 		{Group: mdb.SettingGroupEpay, Key: mdb.SettingKeyEpayDefaultNetwork, Value: "", Type: mdb.SettingTypeString},
+		{Group: mdb.SettingGroupEpay, Key: mdb.SettingKeyEpayPackageTolerance, Value: "2", Type: mdb.SettingTypeString},
 		{Group: mdb.SettingGroupOkPay, Key: mdb.SettingKeyOkPayEnabled, Value: "false", Type: mdb.SettingTypeBool},
 		{Group: mdb.SettingGroupOkPay, Key: mdb.SettingKeyOkPayAPIURL, Value: "https://api.okaypay.me/shop/", Type: mdb.SettingTypeString},
 		{Group: mdb.SettingGroupOkPay, Key: mdb.SettingKeyOkPayCallbackURL, Value: okPayCallbackURL, Type: mdb.SettingTypeString},

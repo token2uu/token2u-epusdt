@@ -269,7 +269,12 @@ func orderProcessing(req *request.OrderProcessingRequest, opts orderProcessingOp
 		return constant.OrderBlockAlreadyProcess
 	}
 
-	updated, err := data.OrderSuccessWithStatusesWithTransaction(tx, req, opts.allowedStatuses)
+	var updated bool
+	if req.PaidAmount > 0 {
+		updated, err = data.OrderSuccessWithPaidAmount(tx, req, opts.allowedStatuses, req.PaidAmount)
+	} else {
+		updated, err = data.OrderSuccessWithStatusesWithTransaction(tx, req, opts.allowedStatuses)
+	}
 	if err != nil {
 		tx.Rollback()
 		return err
@@ -492,7 +497,7 @@ func submitManualPaymentForOrder(order *mdb.Orders, blockTransactionId string, a
 		return nil, err
 	}
 
-	verifiedBlockTransactionID, err := ValidateManualOrderPayment(order, blockTransactionId)
+	validationResult, err := ValidateManualOrderPaymentWithPaidAmount(order, blockTransactionId)
 	if err != nil {
 		var rspErr *constant.RspError
 		if errors.As(err, &rspErr) {
@@ -500,15 +505,21 @@ func submitManualPaymentForOrder(order *mdb.Orders, blockTransactionId string, a
 		}
 		return nil, constant.ManualPaymentVerifyErr
 	}
-	if err = orderProcessingWithAllowedStatuses(&request.OrderProcessingRequest{
+
+	req := &request.OrderProcessingRequest{
 		ReceiveAddress:     order.ReceiveAddress,
 		Currency:           order.Currency,
 		Token:              order.Token,
 		Network:            order.Network,
 		Amount:             order.ActualAmount,
 		TradeId:            order.TradeId,
-		BlockTransactionId: verifiedBlockTransactionID,
-	}, allowedStatuses); err != nil {
+		BlockTransactionId: validationResult.CanonicalTxID,
+	}
+	if validationResult.PaidAmount > 0 && validationResult.PaidAmount != order.ActualAmount {
+		req.PaidAmount = validationResult.PaidAmount
+	}
+
+	if err = orderProcessingWithAllowedStatuses(req, allowedStatuses); err != nil {
 		return nil, err
 	}
 

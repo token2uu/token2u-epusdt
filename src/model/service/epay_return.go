@@ -100,13 +100,16 @@ func BuildEPayResultParams(order *mdb.Orders, apiKeyRow *mdb.ApiKey) (map[string
 		Money:       fmt.Sprintf("%.4f", order.Amount),
 		TradeStatus: "TRADE_SUCCESS",
 	}
+	if order.PaidAmount > 0 {
+		notifyData.PaidMoney = fmt.Sprintf("%.4f", order.PaidAmount)
+	}
 
 	signstr, err := sign.Get(notifyData, apiKeyRow.SecretKey)
 	if err != nil {
 		return nil, constant.EPayReturnSignatureErr
 	}
 
-	return map[string]string{
+	result := map[string]string{
 		"pid":          strconv.Itoa(pidInt),
 		"trade_no":     notifyData.TradeNo,
 		"out_trade_no": notifyData.OutTradeNo,
@@ -116,7 +119,11 @@ func BuildEPayResultParams(order *mdb.Orders, apiKeyRow *mdb.ApiKey) (map[string
 		"trade_status": notifyData.TradeStatus,
 		"sign":         signstr,
 		"sign_type":    "MD5",
-	}, nil
+	}
+	if notifyData.PaidMoney != "" {
+		result["paid_money"] = notifyData.PaidMoney
+	}
+	return result, nil
 }
 
 func appendQueryParams(rawURL string, params map[string]string) (string, error) {

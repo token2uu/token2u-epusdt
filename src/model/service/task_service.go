@@ -75,14 +75,18 @@ func TryProcessTronTRC20Transfer(token mdb.ChainToken, toAddr string, rawValue *
 		return
 	}
 
-	tradeID, err := data.GetTradeIdByWalletAddressAndAmountAndToken(mdb.NetworkTron, addr, tokenSym, amount)
+	matchResult, err := data.GetTradeIdByWalletAddressAndAmountAndTokenWithEpayFallback(mdb.NetworkTron, addr, tokenSym, amount)
 	if err != nil {
 		log.Sugar.Warnf("[TRC20-%s][%s] lock lookup: %v", tokenSym, addr, err)
 		return
 	}
+	tradeID := matchResult.TradeId
 	if tradeID == "" {
 		log.Sugar.Debugf("[TRC20-%s][%s] skip unmatched tx hash=%s amount=%.2f", tokenSym, addr, txHash, amount)
 		return
+	}
+	if matchResult.IsEpayFallback {
+		log.Sugar.Infof("[TRC20-%s][%s] epay fallback match trade_id=%s expected_amount!=%.2f", tokenSym, addr, tradeID, amount)
 	}
 
 	order, err := data.GetOrderInfoByTradeId(tradeID)
@@ -110,6 +114,9 @@ func TryProcessTronTRC20Transfer(token mdb.ChainToken, toAddr string, rawValue *
 		TradeId:            tradeID,
 		Amount:             amount,
 		BlockTransactionId: txHash,
+	}
+	if matchResult.IsEpayFallback {
+		req.PaidAmount = amount
 	}
 	err = OrderProcessing(req)
 	if err != nil {
@@ -143,14 +150,18 @@ func TryProcessTronTRXTransfer(toAddr string, rawSun int64, txHash string, block
 		return
 	}
 
-	tradeID, err := data.GetTradeIdByWalletAddressAndAmountAndToken(mdb.NetworkTron, addr, "TRX", amount)
+	matchResult, err := data.GetTradeIdByWalletAddressAndAmountAndTokenWithEpayFallback(mdb.NetworkTron, addr, "TRX", amount)
 	if err != nil {
 		log.Sugar.Warnf("[TRX][%s] lock lookup: %v", addr, err)
 		return
 	}
+	tradeID := matchResult.TradeId
 	if tradeID == "" {
 		log.Sugar.Debugf("[TRX][%s] skip unmatched tx hash=%s amount=%.2f", addr, txHash, amount)
 		return
+	}
+	if matchResult.IsEpayFallback {
+		log.Sugar.Infof("[TRX][%s] epay fallback match trade_id=%s expected_amount!=%.2f", addr, tradeID, amount)
 	}
 
 	order, err := data.GetOrderInfoByTradeId(tradeID)
@@ -170,6 +181,9 @@ func TryProcessTronTRXTransfer(toAddr string, rawSun int64, txHash string, block
 		TradeId:            tradeID,
 		Amount:             amount,
 		BlockTransactionId: txHash,
+	}
+	if matchResult.IsEpayFallback {
+		req.PaidAmount = amount
 	}
 	err = OrderProcessing(req)
 	if err != nil {
@@ -246,7 +260,7 @@ func TryProcessEvmERC20Transfer(chainNetwork string, contract common.Address, to
 
 	log.Sugar.Debugf("[%s-%s][%s] processing transfer hash=%s amount=%.2f", net, tokenSym, walletAddr, txHash, amount)
 
-	order, fromLock, err := resolveEvmTransferOrder(chainNetwork, walletAddr, tokenSym, amount, blockTsMs)
+	order, fromLock, isEpayFallback, err := resolveEvmTransferOrder(chainNetwork, walletAddr, tokenSym, amount, blockTsMs)
 	if err != nil {
 		log.Sugar.Warnf("[%s-%s][%s] load order candidate: %v", net, tokenSym, walletAddr, err)
 		return
@@ -254,6 +268,9 @@ func TryProcessEvmERC20Transfer(chainNetwork string, contract common.Address, to
 	if order == nil || order.ID == 0 {
 		log.Sugar.Warnf("[%s-%s][%s] skip unmatched tx hash=%s amount=%.2f", net, tokenSym, walletAddr, txHash, amount)
 		return
+	}
+	if isEpayFallback {
+		log.Sugar.Infof("[%s-%s][%s] epay fallback match trade_id=%s expected_amount!=%.2f", net, tokenSym, walletAddr, order.TradeId, amount)
 	}
 	if strings.ToLower(strings.TrimSpace(order.Network)) != chainNetwork {
 		log.Sugar.Warnf("[%s-%s][%s] skip trade_id=%s network=%q", net, tokenSym, walletAddr, order.TradeId, order.Network)
@@ -292,6 +309,9 @@ func TryProcessEvmERC20Transfer(chainNetwork string, contract common.Address, to
 		Amount:             amount,
 		BlockTransactionId: txHash,
 	}
+	if isEpayFallback {
+		req.PaidAmount = amount
+	}
 	err = orderProcessingWithAllowedStatuses(req, allowedStatuses)
 	if err != nil {
 		if errors.Is(err, constant.OrderBlockAlreadyProcess) || errors.Is(err, constant.OrderStatusConflict) {
@@ -306,18 +326,18 @@ func TryProcessEvmERC20Transfer(chainNetwork string, contract common.Address, to
 	log.Sugar.Infof("[%s-%s][%s] payment processed trade_id=%s hash=%s", net, tokenSym, walletAddr, order.TradeId, txHash)
 }
 
-func resolveEvmTransferOrder(chainNetwork string, walletAddr string, tokenSym string, amount float64, blockTsMs int64) (*mdb.Orders, bool, error) {
+func resolveEvmTransferOrder(chainNetwork string, walletAddr string, tokenSym string, amount float64, blockTsMs int64) (*mdb.Orders, bool, bool, error) {
 	tradeID, err := data.GetTradeIdByWalletAddressAndAmountAndToken(chainNetwork, walletAddr, tokenSym, amount)
 	if err != nil {
-		return nil, false, err
+		return nil, false, false, err
 	}
 	if tradeID != "" {
 		order, err := data.GetOrderInfoByTradeId(tradeID)
 		if err != nil {
-			return nil, false, err
+			return nil, false, false, err
 		}
 		if order != nil && order.ID > 0 {
-			return order, true, nil
+			return order, true, false, nil
 		}
 	}
 
@@ -327,12 +347,19 @@ func resolveEvmTransferOrder(chainNetwork string, walletAddr string, tokenSym st
 	}
 	order, err := data.GetOnChainOrderByWalletAddressAndAmountAndTokenBeforeTime(chainNetwork, walletAddr, tokenSym, amount, before)
 	if err != nil {
-		return nil, false, err
+		return nil, false, false, err
 	}
 	if order == nil || order.ID == 0 {
-		return nil, false, nil
+		epayOrder, epayErr := data.FindEpayOrderByWalletAddressAndToken(chainNetwork, walletAddr, tokenSym, amount)
+		if epayErr != nil {
+			return nil, false, false, epayErr
+		}
+		if epayOrder != nil && epayOrder.ID > 0 {
+			return epayOrder, false, true, nil
+		}
+		return nil, false, false, nil
 	}
-	return order, false, nil
+	return order, false, false, nil
 }
 
 func sendPaymentNotification(order *mdb.Orders) {

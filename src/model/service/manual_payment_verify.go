@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -41,6 +42,12 @@ var (
 
 type manualOrderPaymentValidatorFunc func(*mdb.Orders, string) (string, error)
 
+// ManualPaymentValidationResult contains the result of manual payment validation.
+type ManualPaymentValidationResult struct {
+	CanonicalTxID string
+	PaidAmount    float64 // actual crypto amount paid, 0 if exact match
+}
+
 // ValidateManualOrderPayment verifies that the supplied chain transaction
 // really settles the order before an admin manually marks it paid. It returns
 // the canonical transaction id that should be persisted for duplicate checks.
@@ -49,6 +56,57 @@ func ValidateManualOrderPayment(order *mdb.Orders, blockTransactionID string) (s
 	validator := manualOrderPaymentValidator
 	manualOrderPaymentValidatorMu.Unlock()
 	return validator(order, blockTransactionID)
+}
+
+// ValidateManualOrderPaymentWithPaidAmount verifies the transaction and returns
+// both the canonical tx ID and the actual paid amount (for EPay orders with amount mismatch).
+func ValidateManualOrderPaymentWithPaidAmount(order *mdb.Orders, blockTransactionID string) (*ManualPaymentValidationResult, error) {
+	canonicalTxID, err := ValidateManualOrderPayment(order, blockTransactionID)
+	if err == nil {
+		return &ManualPaymentValidationResult{
+			CanonicalTxID: canonicalTxID,
+			PaidAmount:    0,
+		}, nil
+	}
+
+	var mismatchErr *AmountMismatchError
+	if !errors.As(err, &mismatchErr) {
+		return nil, err
+	}
+
+	isPackageEpay := data.IsPackageEpayNotifyURL(order.NotifyUrl)
+	isEpay := data.IsEpayNotifyURL(order.NotifyUrl)
+
+	switch {
+	case isPackageEpay:
+		if order.ActualAmount <= 0 {
+			return nil, err
+		}
+		paidFiat := decimal.NewFromFloat(mismatchErr.ActualPaidAmount).
+			Div(decimal.NewFromFloat(order.ActualAmount)).
+			Mul(decimal.NewFromFloat(order.Amount))
+		orderAmt := decimal.NewFromFloat(order.Amount)
+		if paidFiat.LessThan(orderAmt) {
+			shortfall := orderAmt.Sub(paidFiat)
+			tolerance := decimal.NewFromFloat(data.GetEpayPackageAmountTolerance())
+			if shortfall.GreaterThan(tolerance) {
+				return nil, err
+			}
+		}
+		return &ManualPaymentValidationResult{
+			CanonicalTxID: strings.TrimSpace(blockTransactionID),
+			PaidAmount:    mismatchErr.ActualPaidAmount,
+		}, nil
+
+	case isEpay:
+		return &ManualPaymentValidationResult{
+			CanonicalTxID: strings.TrimSpace(blockTransactionID),
+			PaidAmount:    mismatchErr.ActualPaidAmount,
+		}, nil
+
+	default:
+		return nil, err
+	}
 }
 
 // SetManualOrderPaymentValidatorForTest swaps the chain verifier in tests so
@@ -223,12 +281,19 @@ func closeManualEvmClients(clients []manualEvmClient) {
 
 func validateManualEvmPaymentAcrossClients(ctx context.Context, clients []manualEvmClient, order *mdb.Orders, txHash common.Hash, token *mdb.ChainToken) error {
 	var verifyErrors []string
+	var mismatchErr *AmountMismatchError
 	for _, item := range clients {
 		if err := validateManualEvmPaymentWithClient(ctx, item.reader, order, txHash, token); err != nil {
+			if mismatchErr == nil {
+				errors.As(err, &mismatchErr)
+			}
 			verifyErrors = append(verifyErrors, fmt.Sprintf("%s: %v", item.label, err))
 			continue
 		}
 		return nil
+	}
+	if mismatchErr != nil {
+		return mismatchErr
 	}
 	if len(verifyErrors) > 0 {
 		return fmt.Errorf("manual EVM verification failed: %s", strings.Join(verifyErrors, "; "))
@@ -267,6 +332,7 @@ func validateManualEvmPaymentWithClient(ctx context.Context, client evmChainRead
 		return fmt.Errorf("invalid order receive address: %w", err)
 	}
 	amountMismatch := false
+	var mismatchedAmount float64
 	for _, item := range receipt.Logs {
 		if item == nil || !strings.EqualFold(item.Address.Hex(), contract.Hex()) {
 			continue
@@ -282,10 +348,11 @@ func validateManualEvmPaymentWithClient(ctx context.Context, client evmChainRead
 			return nil
 		}
 		amountMismatch = true
+		mismatchedAmount = rawAmountToFloat(rawAmount, token.Decimals)
 	}
 
 	if amountMismatch {
-		return fmt.Errorf("transaction amount mismatch")
+		return &AmountMismatchError{ActualPaidAmount: mismatchedAmount}
 	}
 	return fmt.Errorf("matching token transfer to order address not found")
 }
@@ -541,7 +608,7 @@ func validateManualTronNativeTransfer(order *mdb.Orders, tx *manualTronTransacti
 		return fmt.Errorf("transaction recipient mismatch")
 	}
 	if !amountMatchesRaw(order.ActualAmount, big.NewInt(val.Amount), 6) {
-		return fmt.Errorf("transaction amount mismatch")
+		return &AmountMismatchError{ActualPaidAmount: rawAmountToFloat(big.NewInt(val.Amount), 6)}
 	}
 	return nil
 }
@@ -574,6 +641,7 @@ func validateManualTronTRC20TransferEvent(order *mdb.Orders, info *manualTronTxI
 	}
 	transferTopic := strings.TrimPrefix(erc20TransferEventHash.Hex(), "0x")
 	amountMismatch := false
+	var mismatchedAmount float64
 	for _, event := range info.Log {
 		eventContractHex, err := normalizeTronAddressHex(event.Address)
 		if err != nil || eventContractHex != contractHex {
@@ -594,9 +662,10 @@ func validateManualTronTRC20TransferEvent(order *mdb.Orders, info *manualTronTxI
 			return nil
 		}
 		amountMismatch = true
+		mismatchedAmount = rawAmountToFloat(rawAmount, decimals)
 	}
 	if amountMismatch {
-		return fmt.Errorf("transaction amount mismatch")
+		return &AmountMismatchError{ActualPaidAmount: mismatchedAmount}
 	}
 	return fmt.Errorf("matching TRC20 transfer event to order address not found")
 }
@@ -674,6 +743,7 @@ func validateManualTonPayment(order *mdb.Orders, txID string) (string, error) {
 	}
 
 	var verifyErrors []string
+	var mismatchErr *AmountMismatchError
 	for _, node := range nodes {
 		api, closeFn, err := dialManualTonClient(node)
 		if err != nil {
@@ -683,10 +753,16 @@ func validateManualTonPayment(order *mdb.Orders, txID string) (string, error) {
 		canonicalID, err := validateManualTonPaymentWithAPI(context.Background(), api, order, orderAddr.Address, ref)
 		closeFn()
 		if err != nil {
+			if mismatchErr == nil {
+				errors.As(err, &mismatchErr)
+			}
 			verifyErrors = append(verifyErrors, fmt.Sprintf("%s: %v", manualRpcNodeLabel(node), err))
 			continue
 		}
 		return canonicalID, nil
+	}
+	if mismatchErr != nil {
+		return "", mismatchErr
 	}
 	if len(verifyErrors) > 0 {
 		return "", fmt.Errorf("manual TON verification failed: %s", strings.Join(verifyErrors, "; "))
@@ -895,16 +971,23 @@ func validateManualSolanaPayment(order *mdb.Orders, sig string) (string, error) 
 	}
 
 	var verifyErrors []string
+	var mismatchErr *AmountMismatchError
 	for _, node := range nodes {
 		rpcURL := strings.TrimSpace(node.Url)
 		if rpcURL == "" {
 			continue
 		}
 		if err = validateManualSolanaPaymentWithRPC(order, sig, node); err != nil {
+			if mismatchErr == nil {
+				errors.As(err, &mismatchErr)
+			}
 			verifyErrors = append(verifyErrors, fmt.Sprintf("%s: %v", manualRpcNodeLabel(node), err))
 			continue
 		}
 		return sig, nil
+	}
+	if mismatchErr != nil {
+		return "", mismatchErr
 	}
 	if len(verifyErrors) > 0 {
 		return "", fmt.Errorf("manual Solana verification failed: %s", strings.Join(verifyErrors, "; "))
@@ -945,6 +1028,7 @@ func validateManualSolanaPaymentWithRPC(order *mdb.Orders, sig string, node mdb.
 
 	instructions := gjson.GetBytes(txData, "result.transaction.message.instructions").Array()
 	amountMismatch := false
+	var mismatchedAmount float64
 	for _, instruction := range instructions {
 		transferInfo, parseErr := ParseTransferInfoFromInstruction(instruction, txData)
 		if parseErr != nil || transferInfo == nil {
@@ -964,9 +1048,10 @@ func validateManualSolanaPaymentWithRPC(order *mdb.Orders, sig string, node mdb.
 			return nil
 		}
 		amountMismatch = true
+		mismatchedAmount = amount
 	}
 	if amountMismatch {
-		return fmt.Errorf("transaction amount mismatch")
+		return &AmountMismatchError{ActualPaidAmount: mismatchedAmount}
 	}
 	return fmt.Errorf("matching solana transfer to order address not found")
 }
@@ -1047,6 +1132,29 @@ func amountMatchesFloat(expected, actual float64) bool {
 func roundedAmount(amount float64) decimal.Decimal {
 	precision := data.GetAmountPrecision()
 	return decimal.NewFromFloat(math.MustParsePrecFloat64(amount, precision)).Round(int32(precision))
+}
+
+func rawAmountToFloat(rawAmount *big.Int, decimals int) float64 {
+	if rawAmount == nil {
+		return 0
+	}
+	if decimals < 0 {
+		decimals = 0
+	}
+	d := decimal.NewFromBigInt(rawAmount, -int32(decimals))
+	f, _ := d.Float64()
+	return f
+}
+
+// AmountMismatchError is returned when a transaction's actual paid amount
+// differs from the order's expected amount. It carries the actual amount so
+// that callers (e.g. package EPay tolerance) can decide whether to accept.
+type AmountMismatchError struct {
+	ActualPaidAmount float64
+}
+
+func (e *AmountMismatchError) Error() string {
+	return "transaction amount mismatch"
 }
 
 func tronHexToAddress(hexAddr string) (string, error) {

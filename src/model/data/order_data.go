@@ -201,6 +201,41 @@ func OrderSuccessWithStatusesWithTransaction(tx *gorm.DB, req *request.OrderProc
 	return result.RowsAffected > 0, result.Error
 }
 
+// OrderSuccessWithPaidAmount marks an order as paid, recording the fiat equivalent
+// of the actual cryptocurrency amount paid. paidAmountCrypto is the actual crypto
+// received; paid_amount is calculated as fiat based on the order's exchange rate.
+func OrderSuccessWithPaidAmount(tx *gorm.DB, req *request.OrderProcessingRequest, allowedStatuses []int, paidAmountCrypto float64) (bool, error) {
+	if len(allowedStatuses) == 0 {
+		return false, nil
+	}
+
+	order, err := GetOrderInfoByTradeId(req.TradeId)
+	if err != nil {
+		return false, err
+	}
+	if order.ID == 0 {
+		return false, nil
+	}
+
+	updates := map[string]interface{}{
+		"block_transaction_id": req.BlockTransactionId,
+		"status":               mdb.StatusPaySuccess,
+		"callback_confirm":     mdb.CallBackConfirmNo,
+	}
+
+	if order.ActualAmount > 0 && paidAmountCrypto != order.ActualAmount {
+		ratio := decimal.NewFromFloat(paidAmountCrypto).Div(decimal.NewFromFloat(order.ActualAmount))
+		paidAmountFiat := decimal.NewFromFloat(order.Amount).Mul(ratio).Round(2)
+		updates["paid_amount"] = paidAmountFiat.InexactFloat64()
+	}
+
+	result := tx.Model(&mdb.Orders{}).
+		Where("trade_id = ?", req.TradeId).
+		Where("status IN ?", allowedStatuses).
+		Updates(updates)
+	return result.RowsAffected > 0, result.Error
+}
+
 // GetPendingCallbackOrders returns the minimal callback scheduling state.
 func GetPendingCallbackOrders(maxRetry int, limit int) ([]PendingCallbackOrder, error) {
 	var orders []PendingCallbackOrder
@@ -578,4 +613,124 @@ func UnLockTransactionByTradeId(tradeID string) error {
 
 func CleanupExpiredTransactionLocks() error {
 	return dao.RuntimeDB.Where("expires_at <= ?", time.Now()).Delete(&mdb.TransactionLock{}).Error
+}
+
+// TransactionMatchResult holds the result of matching a transfer to an order.
+type TransactionMatchResult struct {
+	TradeId        string
+	IsEpayFallback bool
+}
+
+// IsEpayNotifyURL checks if the notify URL indicates an EPay-style order
+// where amount mismatch is acceptable.
+func IsEpayNotifyURL(notifyUrl string) bool {
+	notifyUrl = strings.ToLower(strings.TrimSpace(notifyUrl))
+	return strings.Contains(notifyUrl, "epay")
+}
+
+// IsPackageEpayNotifyURL checks if the notify URL indicates a package EPay
+// order where amount mismatch is subject to a configurable fiat tolerance.
+func IsPackageEpayNotifyURL(notifyUrl string) bool {
+	notifyUrl = strings.ToLower(strings.TrimSpace(notifyUrl))
+	return strings.HasSuffix(notifyUrl, "/api/user/package/epay/notify")
+}
+
+// packageEpayAmountWithinTolerance reports whether the actual crypto payment
+// falls inside the acceptable fiat tolerance for a package EPay order.
+// Overpayment is always accepted; underpayment is accepted when the fiat
+// shortfall does not exceed the configured tolerance.
+func packageEpayAmountWithinTolerance(order *mdb.Orders, paidCrypto float64) bool {
+	if order.ActualAmount <= 0 {
+		return false
+	}
+	ratio := decimal.NewFromFloat(paidCrypto).Div(decimal.NewFromFloat(order.ActualAmount))
+	paidFiat := decimal.NewFromFloat(order.Amount).Mul(ratio)
+	orderAmt := decimal.NewFromFloat(order.Amount)
+	if paidFiat.GreaterThanOrEqual(orderAmt) {
+		return true
+	}
+	shortfall := orderAmt.Sub(paidFiat)
+	tolerance := decimal.NewFromFloat(GetEpayPackageAmountTolerance())
+	return shortfall.LessThanOrEqual(tolerance)
+}
+
+// GetTradeIdByWalletAddressAndAmountAndTokenWithEpayFallback first tries exact amount match.
+// If no match is found, it falls back to any active EPay order at the same address.
+func GetTradeIdByWalletAddressAndAmountAndTokenWithEpayFallback(network string, address string, token string, amount float64) (*TransactionMatchResult, error) {
+	tradeID, err := GetTradeIdByWalletAddressAndAmountAndToken(network, address, token, amount)
+	if err != nil {
+		return nil, err
+	}
+	if tradeID != "" {
+		return &TransactionMatchResult{TradeId: tradeID, IsEpayFallback: false}, nil
+	}
+
+	network = normalizeLockNetwork(network)
+	address = normalizeLockAddress(network, address)
+	token = normalizeLockToken(token)
+	now := time.Now()
+
+	var locks []mdb.TransactionLock
+	err = activeLocksForAddress(dao.RuntimeDB, network, address, token, now).
+		Order("created_at ASC").
+		Find(&locks).Error
+	if err != nil {
+		return nil, err
+	}
+
+	for _, lock := range locks {
+		order, err := GetOrderInfoByTradeId(lock.TradeId)
+		if err != nil {
+			continue
+		}
+		if order.ID == 0 {
+			continue
+		}
+		if order.Status != mdb.StatusWaitPay {
+			continue
+		}
+		if !IsEpayNotifyURL(order.NotifyUrl) {
+			continue
+		}
+		if IsPackageEpayNotifyURL(order.NotifyUrl) {
+			if !packageEpayAmountWithinTolerance(order, amount) {
+				continue
+			}
+		}
+		return &TransactionMatchResult{TradeId: lock.TradeId, IsEpayFallback: true}, nil
+	}
+
+	return &TransactionMatchResult{TradeId: "", IsEpayFallback: false}, nil
+}
+
+// FindEpayOrderByWalletAddressAndToken finds an active EPay order matching the
+// wallet address and token. Used as a fallback when exact amount match fails.
+func FindEpayOrderByWalletAddressAndToken(network string, address string, token string, amount float64) (*mdb.Orders, error) {
+	network = normalizeLockNetwork(network)
+	address = normalizeLockAddress(network, address)
+	token = normalizeLockToken(token)
+
+	order := new(mdb.Orders)
+	query := dao.Mdb.Model(order).
+		Where("network = ?", network).
+		Where("token = ?", token).
+		Where("status = ?", mdb.StatusWaitPay).
+		Where("(pay_provider = ? OR pay_provider = '')", mdb.PaymentProviderOnChain)
+	query = applyOrderReceiveAddressFilter(query, network, address)
+	err := query.Order("created_at desc").Limit(1).Find(order).Error
+	if err != nil {
+		return nil, err
+	}
+	if order.ID == 0 {
+		return nil, nil
+	}
+	if !IsEpayNotifyURL(order.NotifyUrl) {
+		return nil, nil
+	}
+	if IsPackageEpayNotifyURL(order.NotifyUrl) {
+		if !packageEpayAmountWithinTolerance(order, amount) {
+			return nil, nil
+		}
+	}
+	return order, nil
 }

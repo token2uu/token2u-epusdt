@@ -40,6 +40,7 @@ type OrderProcessingRequest struct {
 	Token              string
 	Network            string
 	Amount             float64
+	PaidAmount         float64
 	TradeId            string
 	BlockTransactionId string
 }

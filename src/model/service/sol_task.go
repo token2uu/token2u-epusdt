@@ -220,16 +220,21 @@ func SolCallBack(address string, wg *sync.WaitGroup) {
 			log.Sugar.Infof("[SOL][%s] sig=%s instr[%d] incoming transfer confirmed: token=%s amount=%.2f -> querying transaction_lock network=solana address=%s token=%s amount=%.2f",
 				address, sig, instrIdx, token, amount, address, token, amount)
 
-			tradeID, err := data.GetTradeIdByWalletAddressAndAmountAndToken(mdb.NetworkSolana, address, token, amount)
+			matchResult, err := data.GetTradeIdByWalletAddressAndAmountAndTokenWithEpayFallback(mdb.NetworkSolana, address, token, amount)
 			if err != nil {
 				log.Sugar.Errorf("[SOL][%s] sig=%s query transaction_lock failed: %v", address, sig, err)
 				retrySignature = true
 				continue
 			}
+			tradeID := matchResult.TradeId
 			if tradeID == "" {
 				log.Sugar.Infof("[SOL][%s] sig=%s no active transaction_lock matched: network=solana address=%s token=%s amount=%.2f (no order or expired)",
 					address, sig, address, token, amount)
 				continue
+			}
+			if matchResult.IsEpayFallback {
+				log.Sugar.Infof("[SOL][%s] sig=%s epay fallback match trade_id=%s expected_amount!=%.2f",
+					address, sig, tradeID, amount)
 			}
 			log.Sugar.Infof("[SOL][%s] transaction_lock matched: trade_id=%s sig=%s token=%s amount=%.2f",
 				address, tradeID, sig, token, amount)
@@ -261,6 +266,9 @@ func SolCallBack(address string, wg *sync.WaitGroup) {
 				TradeId:            tradeID,
 				Amount:             amount,
 				BlockTransactionId: sig,
+			}
+			if matchResult.IsEpayFallback {
+				req.PaidAmount = amount
 			}
 			log.Sugar.Infof("[SOL][%s] calling OrderProcessing: trade_id=%s sig=%s token=%s amount=%.2f",
 				address, tradeID, sig, token, amount)

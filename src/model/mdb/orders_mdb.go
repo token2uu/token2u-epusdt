@@ -73,6 +73,9 @@ type Orders struct {
 	// PayBySubId holds the primary-key ID of the sub-order that settled this parent order.
 	// Zero when the parent order was paid directly (no sub-order involved).
 	PayBySubId uint64 `gorm:"column:pay_by_sub_id;default:0" json:"pay_by_sub_id" example:"0"`
+	// PaidAmount stores the fiat equivalent of the actual crypto amount paid
+	// when it differs from the order's expected amount (EPay amount mismatch).
+	PaidAmount float64 `gorm:"column:paid_amount;default:0" json:"paid_amount" example:"70.02"`
 	BaseModel
 }
 

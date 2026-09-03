@@ -1,6 +1,7 @@
 package service
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -326,15 +327,22 @@ func ValidateManualAptosPayment(order *mdb.Orders, txID string) (string, error) 
 	}
 
 	var verifyErrors []string
+	var mismatchErr *AmountMismatchError
 	for _, node := range nodes {
 		if strings.TrimSpace(node.Url) == "" {
 			continue
 		}
 		if _, err = validateManualAptosPaymentWithNode(order, txID, node); err != nil {
+			if mismatchErr == nil {
+				errors.As(err, &mismatchErr)
+			}
 			verifyErrors = append(verifyErrors, fmt.Sprintf("%s: %v", data.RpcNodeLogLabel(node), err))
 			continue
 		}
 		return txID, nil
+	}
+	if mismatchErr != nil {
+		return "", mismatchErr
 	}
 	if len(verifyErrors) > 0 {
 		return "", fmt.Errorf("manual Aptos verification failed: %s", strings.Join(verifyErrors, "; "))
@@ -370,6 +378,7 @@ func validateManualAptosTransactionWithConfirm(order *mdb.Orders, txID string, b
 		return err
 	}
 	amountMismatch := false
+	var mismatchErr *AmountMismatchError
 	for _, transfer := range transfers {
 		if !strings.EqualFold(transfer.TxID, txID) {
 			continue
@@ -379,12 +388,19 @@ func validateManualAptosTransactionWithConfirm(order *mdb.Orders, txID string, b
 		}
 		if err = EnsureMoveTransferMatchesOrder(order, transfer); err == nil {
 			return nil
-		}
-		if strings.Contains(err.Error(), "amount mismatch") {
+		} else if amtErr := (*AmountMismatchError)(nil); errors.As(err, &amtErr) {
+			if mismatchErr == nil {
+				mismatchErr = amtErr
+			}
+			amountMismatch = true
+		} else if strings.Contains(err.Error(), "amount mismatch") {
 			amountMismatch = true
 		} else {
 			return err
 		}
+	}
+	if mismatchErr != nil {
+		return mismatchErr
 	}
 	if amountMismatch {
 		return fmt.Errorf("transaction amount mismatch")

@@ -134,14 +134,18 @@ func TryProcessTonTransfer(transfer *TonObservedTransfer) {
 	}
 	log.Sugar.Infof("[TON-%s][%s] observed transfer tx=%s lt=%d amount=%.6f", tokenSym, receive, transfer.BlockID, transfer.LT, transfer.Amount)
 
-	tradeID, err := data.GetTradeIdByWalletAddressAndAmountAndToken(mdb.NetworkTon, receive, tokenSym, transfer.Amount)
+	matchResult, err := data.GetTradeIdByWalletAddressAndAmountAndTokenWithEpayFallback(mdb.NetworkTon, receive, tokenSym, transfer.Amount)
 	if err != nil {
 		log.Sugar.Warnf("[TON-%s][%s] lock lookup: %v", tokenSym, receive, err)
 		return
 	}
+	tradeID := matchResult.TradeId
 	if tradeID == "" {
 		log.Sugar.Infof("[TON-%s][%s] skip unmatched transfer tx=%s amount=%.6f", tokenSym, receive, transfer.BlockID, transfer.Amount)
 		return
+	}
+	if matchResult.IsEpayFallback {
+		log.Sugar.Infof("[TON-%s][%s] epay fallback match trade_id=%s expected_amount!=%.6f", tokenSym, receive, tradeID, transfer.Amount)
 	}
 
 	order, err := data.GetOrderInfoByTradeId(tradeID)
@@ -173,6 +177,9 @@ func TryProcessTonTransfer(transfer *TonObservedTransfer) {
 		TradeId:            tradeID,
 		Amount:             transfer.Amount,
 		BlockTransactionId: transfer.BlockID,
+	}
+	if matchResult.IsEpayFallback {
+		req.PaidAmount = transfer.Amount
 	}
 	err = OrderProcessing(req)
 	if err != nil {
@@ -256,7 +263,7 @@ func EnsureTonTransferMatchesOrder(order *mdb.Orders, transfer *TonObservedTrans
 		return fmt.Errorf("transaction predates the order")
 	}
 	if !amountMatchesRaw(order.ActualAmount, transfer.RawAmount, transfer.Token.Decimals) {
-		return fmt.Errorf("transaction amount mismatch")
+		return &AmountMismatchError{ActualPaidAmount: rawAmountToFloat(transfer.RawAmount, transfer.Token.Decimals)}
 	}
 	return nil
 }

@@ -102,7 +102,7 @@ func processExpiredOrders() {
 		}
 
 		for _, order := range orders {
-			expired, err := data.UpdateOrderIsExpirationById(order.ID, expirationCutoff)
+			expired, err := data.UpdateOrderIsExpirationById(order.ID, expirationCutoff, order.Status == mdb.StatusWaitPay)
 			if err != nil {
 				log.Sugar.Errorf("[mq] expire order failed, trade_id=%s, err=%v", order.TradeId, err)
 				continue
@@ -176,7 +176,10 @@ func processCallback(tradeID string) {
 		log.Sugar.Errorf("[mq] reload callback order failed, trade_id=%s, err=%v", tradeID, err)
 		return
 	}
-	if freshOrder.ID <= 0 || freshOrder.Status != mdb.StatusPaySuccess || freshOrder.CallBackConfirm != mdb.CallBackConfirmNo {
+	if freshOrder.ID <= 0 || freshOrder.CallBackConfirm != mdb.CallBackConfirmNo {
+		return
+	}
+	if freshOrder.Status != mdb.StatusPaySuccess && freshOrder.Status != mdb.StatusExpired {
 		return
 	}
 
@@ -230,7 +233,7 @@ func sendOrderCallback(order *mdb.Orders) error {
 			ReceiveAddress:     order.ReceiveAddress,
 			Token:              order.Token,
 			BlockTransactionId: order.BlockTransactionId,
-			Status:             mdb.StatusPaySuccess,
+			Status:             order.Status,
 		}
 		signature, err := sign.GetHMACSHA256(orderResp, apiKeyRow.SecretKey)
 		if err != nil {

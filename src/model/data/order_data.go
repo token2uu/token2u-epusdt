@@ -236,6 +236,11 @@ func OrderSuccessWithPaidAmount(tx *gorm.DB, req *request.OrderProcessingRequest
 	return result.RowsAffected > 0, result.Error
 }
 
+// expiredCallbackEnabledFrom is the earliest updated_at for which expired-order
+// callbacks are dispatched. Orders that were expired before this feature shipped
+// have older updated_at values and are silently skipped.
+var expiredCallbackEnabledFrom = time.Date(2026, 9, 3, 0, 0, 0, 0, time.Local)
+
 // GetPendingCallbackOrders returns the minimal callback scheduling state.
 func GetPendingCallbackOrders(maxRetry int, limit int) ([]PendingCallbackOrder, error) {
 	var orders []PendingCallbackOrder
@@ -243,7 +248,8 @@ func GetPendingCallbackOrders(maxRetry int, limit int) ([]PendingCallbackOrder, 
 		Select("trade_id", "callback_num", "callback_confirm", "updated_at").
 		Where("callback_num <= ?", maxRetry).
 		Where("callback_confirm = ?", mdb.CallBackConfirmNo).
-		Where("status = ?", mdb.StatusPaySuccess).
+		Where("status IN ?", []int{mdb.StatusPaySuccess, mdb.StatusExpired}).
+		Where("updated_at >= ?", expiredCallbackEnabledFrom).
 		Order("updated_at asc")
 	if limit > 0 {
 		query = query.Limit(limit)
@@ -264,12 +270,19 @@ func SaveCallBackOrdersResp(order *mdb.Orders) error {
 }
 
 // UpdateOrderIsExpirationById expires an order only if it is still pending and already timed out.
-func UpdateOrderIsExpirationById(id uint64, expirationCutoff time.Time) (bool, error) {
+// When withCallback is true, callback_confirm is also set so the MQ worker dispatches a notification.
+func UpdateOrderIsExpirationById(id uint64, expirationCutoff time.Time, withCallback bool) (bool, error) {
+	updates := map[string]interface{}{
+		"status": mdb.StatusExpired,
+	}
+	if withCallback {
+		updates["callback_confirm"] = mdb.CallBackConfirmNo
+	}
 	result := dao.Mdb.Model(mdb.Orders{}).
 		Where("id = ?", id).
 		Where("status IN ?", []int{mdb.StatusWaitPay, mdb.StatusWaitSelect}).
 		Where("created_at <= ?", expirationCutoff).
-		Update("status", mdb.StatusExpired)
+		Updates(updates)
 	return result.RowsAffected > 0, result.Error
 }
 

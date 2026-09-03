@@ -91,6 +91,11 @@ func BuildEPayResultParams(order *mdb.Orders, apiKeyRow *mdb.ApiKey) (map[string
 		return nil, constant.EPayReturnSignatureErr
 	}
 
+	tradeStatus := "TRADE_SUCCESS"
+	if order.Status == mdb.StatusExpired {
+		tradeStatus = "TRADE_CLOSED"
+	}
+
 	notifyData := response.OrderNotifyResponseEpay{
 		PID:         pidInt,
 		TradeNo:     order.TradeId,
@@ -98,7 +103,7 @@ func BuildEPayResultParams(order *mdb.Orders, apiKeyRow *mdb.ApiKey) (map[string
 		Type:        epayResultType(order),
 		Name:        order.Name,
 		Money:       fmt.Sprintf("%.4f", order.Amount),
-		TradeStatus: "TRADE_SUCCESS",
+		TradeStatus: tradeStatus,
 	}
 	if order.PaidAmount > 0 {
 		notifyData.PaidMoney = fmt.Sprintf("%.4f", order.PaidAmount)

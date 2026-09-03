@@ -120,7 +120,7 @@ func CloseOrderManually(tradeID string) (bool, error) {
 func ReopenOrderCallback(tradeID string) (bool, error) {
 	result := dao.Mdb.Model(&mdb.Orders{}).
 		Where("trade_id = ?", tradeID).
-		Where("status = ?", mdb.StatusPaySuccess).
+		Where("status IN ?", []int{mdb.StatusPaySuccess, mdb.StatusExpired}).
 		Updates(map[string]interface{}{
 			"callback_confirm": mdb.CallBackConfirmNo,
 			"callback_num":     0,

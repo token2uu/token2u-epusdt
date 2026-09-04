@@ -223,13 +223,17 @@ func sendOrderCallback(order *mdb.Orders) error {
 	default:
 
 		client := http_client.GetHttpClient()
+		paidAmount := order.PaidAmount
+		if data.IsPackageEpayNotifyURL(order.NotifyUrl) {
+			paidAmount = 0
+		}
 		orderResp := response.OrderNotifyResponse{
 			Pid:                apiKeyRow.Pid,
 			TradeId:            order.TradeId,
 			OrderId:            order.OrderId,
 			Amount:             order.Amount,
 			ActualAmount:       order.ActualAmount,
-			PaidAmount:         order.PaidAmount,
+			PaidAmount:         paidAmount,
 			ReceiveAddress:     order.ReceiveAddress,
 			Token:              order.Token,
 			BlockTransactionId: order.BlockTransactionId,

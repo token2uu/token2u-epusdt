@@ -643,29 +643,11 @@ func IsEpayNotifyURL(notifyUrl string) bool {
 }
 
 // IsPackageEpayNotifyURL checks if the notify URL indicates a package EPay
-// order where amount mismatch is subject to a configurable fiat tolerance.
+// order. Package EPay orders require exact amount match and do not participate
+// in the EPay fallback matching path.
 func IsPackageEpayNotifyURL(notifyUrl string) bool {
 	notifyUrl = strings.ToLower(strings.TrimSpace(notifyUrl))
 	return strings.HasSuffix(notifyUrl, "/api/user/package/epay/notify")
-}
-
-// packageEpayAmountWithinTolerance reports whether the actual crypto payment
-// falls inside the acceptable fiat tolerance for a package EPay order.
-// Overpayment is always accepted; underpayment is accepted when the fiat
-// shortfall does not exceed the configured tolerance.
-func packageEpayAmountWithinTolerance(order *mdb.Orders, paidCrypto float64) bool {
-	if order.ActualAmount <= 0 {
-		return false
-	}
-	ratio := decimal.NewFromFloat(paidCrypto).Div(decimal.NewFromFloat(order.ActualAmount))
-	paidFiat := decimal.NewFromFloat(order.Amount).Mul(ratio)
-	orderAmt := decimal.NewFromFloat(order.Amount)
-	if paidFiat.GreaterThanOrEqual(orderAmt) {
-		return true
-	}
-	shortfall := orderAmt.Sub(paidFiat)
-	tolerance := decimal.NewFromFloat(GetEpayPackageAmountTolerance())
-	return shortfall.LessThanOrEqual(tolerance)
 }
 
 // GetTradeIdByWalletAddressAndAmountAndTokenWithEpayFallback first tries exact amount match.
@@ -707,9 +689,7 @@ func GetTradeIdByWalletAddressAndAmountAndTokenWithEpayFallback(network string, 
 			continue
 		}
 		if IsPackageEpayNotifyURL(order.NotifyUrl) {
-			if !packageEpayAmountWithinTolerance(order, amount) {
-				continue
-			}
+			continue
 		}
 		return &TransactionMatchResult{TradeId: lock.TradeId, IsEpayFallback: true}, nil
 	}
@@ -742,9 +722,7 @@ func FindEpayOrderByWalletAddressAndToken(network string, address string, token 
 		return nil, nil
 	}
 	if IsPackageEpayNotifyURL(order.NotifyUrl) {
-		if !packageEpayAmountWithinTolerance(order, amount) {
-			return nil, nil
-		}
+		return nil, nil
 	}
 	return order, nil
 }

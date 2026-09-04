@@ -280,19 +280,6 @@ func GetOkPayAllowTokens() []string {
 	return out
 }
 
-// GetEpayPackageAmountTolerance returns the configured fiat-amount tolerance
-// for package EPay orders, clamped to [0, SettingMaxEpayPackageTolerance].
-func GetEpayPackageAmountTolerance() float64 {
-	v := GetSettingFloat(mdb.SettingKeyEpayPackageTolerance, mdb.SettingDefaultEpayPackageTolerance)
-	if v < 0 {
-		return 0
-	}
-	if v > mdb.SettingMaxEpayPackageTolerance {
-		return mdb.SettingMaxEpayPackageTolerance
-	}
-	return v
-}
-
 // ListSettingsByGroup returns all rows for a given group (empty group = all),
 // excluding any keys in sensitiveSettingKeys.
 func ListSettingsByGroup(group string) ([]mdb.Setting, error) {

@@ -50,10 +50,9 @@ const (
 	SettingKeyRateCacheTTLSeconds      = "rate.cache_ttl_seconds"
 
 	// EPAY route defaults — can be overridden via admin settings.
-	SettingKeyEpayDefaultToken     = "epay.default_token"
-	SettingKeyEpayDefaultCurrency  = "epay.default_currency"
-	SettingKeyEpayDefaultNetwork   = "epay.default_network"
-	SettingKeyEpayPackageTolerance = "epay.package_amount_tolerance"
+	SettingKeyEpayDefaultToken    = "epay.default_token"
+	SettingKeyEpayDefaultCurrency = "epay.default_currency"
+	SettingKeyEpayDefaultNetwork  = "epay.default_network"
 
 	// OkPay hosted-checkout settings.
 	SettingKeyOkPayEnabled        = "okpay.enabled"
@@ -67,12 +66,10 @@ const (
 )
 
 const (
-	SettingDefaultSystemLogLevel       = "error"
-	SettingDefaultRateForcedRateList   = `{"cny":{"usdt":0.14705882352941177,"usdc":0.14705882352941177}}`
-	SettingDefaultRateMode             = "fixed"
-	SettingDefaultRateCacheTTL         = 300
-	SettingDefaultEpayPackageTolerance = 2.0
-	SettingMaxEpayPackageTolerance     = 10.0
+	SettingDefaultSystemLogLevel     = "error"
+	SettingDefaultRateForcedRateList = `{"cny":{"usdt":0.14705882352941177,"usdc":0.14705882352941177}}`
+	SettingDefaultRateMode           = "fixed"
+	SettingDefaultRateCacheTTL       = 300
 )
 
 type Setting struct {

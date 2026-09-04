@@ -79,24 +79,7 @@ func ValidateManualOrderPaymentWithPaidAmount(order *mdb.Orders, blockTransactio
 
 	switch {
 	case isPackageEpay:
-		if order.ActualAmount <= 0 {
-			return nil, err
-		}
-		paidFiat := decimal.NewFromFloat(mismatchErr.ActualPaidAmount).
-			Div(decimal.NewFromFloat(order.ActualAmount)).
-			Mul(decimal.NewFromFloat(order.Amount))
-		orderAmt := decimal.NewFromFloat(order.Amount)
-		if paidFiat.LessThan(orderAmt) {
-			shortfall := orderAmt.Sub(paidFiat)
-			tolerance := decimal.NewFromFloat(data.GetEpayPackageAmountTolerance())
-			if shortfall.GreaterThan(tolerance) {
-				return nil, err
-			}
-		}
-		return &ManualPaymentValidationResult{
-			CanonicalTxID: strings.TrimSpace(blockTransactionID),
-			PaidAmount:    mismatchErr.ActualPaidAmount,
-		}, nil
+		return nil, err
 
 	case isEpay:
 		return &ManualPaymentValidationResult{

@@ -1,0 +1,48 @@
+# 注入版构建：LoongSuite 编译期 OTel 注入（零代码）。
+# 原 Dockerfile 保持不动；发布流水线通过入口配置 `dockerfile: 'Dockerfile.otel'`
+# （→ DOCKERFILE 环境变量 → scripts/ci/build-image.sh -f）选用本文件。
+# 与 Dockerfile 的差别：builder 阶段装固定版本的 otel 工具（校验 sha256）+ 一条 Go 版本守卫
+# （原构建器是浮动的 golang:alpine，LoongSuite 要求 Go >= 1.25），构建命令加 `otel ` 前缀。
+FROM golang:alpine AS builder
+
+RUN apk add --no-cache --update git build-base curl
+# LoongSuite 要求 Go >= 1.25：构建器是浮动 tag，这里显式守卫，避免哪天 alpine 换版本后静默失败。
+RUN go version | grep -E 'go1\.(2[5-9]|[3-9][0-9])' \
+    || { echo "builder Go too old for LoongSuite (need >= 1.25); pin golang:1.25-alpine or newer" >&2; exit 1; }
+# LoongSuite 工具：固定版本 + sha256 校验（见 docs/application-pipelines.md）。
+ARG TARGETARCH
+ARG OTEL_TOOL_VERSION=v1.15.0
+RUN set -eux; \
+    case "${TARGETARCH:-amd64}" in \
+      amd64) task_asset=otel-linux-amd64; task_sha=ef4d780d7d668e80535dbfa02ea0ddb259468e2a492c88a27c65940482d1d221 ;; \
+      arm64) task_asset=otel-linux-arm64; task_sha=41a72e6dfbd5b83b8b05b110dc5dcdc738ad1be7f8e1daef8de49b2bd575ed4c ;; \
+      *) echo "unsupported architecture: ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSLo /usr/local/bin/otel "https://github.com/alibaba/loongsuite-go/releases/download/${OTEL_TOOL_VERSION}/${task_asset}"; \
+    echo "${task_sha}  /usr/local/bin/otel" | sha256sum -c -; \
+    chmod 0755 /usr/local/bin/otel; otel version
+ENV CGO_ENABLED=0
+
+WORKDIR /app
+
+COPY . /app
+
+WORKDIR /app/src
+ARG BUILD_VERSION=0.0.0-dev
+RUN go mod download
+RUN otel go build -trimpath -ldflags="-s -w -X github.com/GMWalletApp/epusdt/config.BuildVersion=${BUILD_VERSION}" -o /app/epusdt .
+
+FROM alpine:latest AS runner
+ENV TZ=Asia/Shanghai
+RUN apk --no-cache add ca-certificates tzdata
+ARG API_RATE_URL=""
+
+WORKDIR /app
+COPY --from=builder /app/src/.env.example /app/.env
+RUN if [ -n "$API_RATE_URL" ]; then \
+      sed -i "s|^api_rate_url=.*$|api_rate_url=${API_RATE_URL}|" /app/.env; \
+    fi
+COPY --from=builder /app/epusdt .
+
+VOLUME /app/conf
+ENTRYPOINT ["./epusdt", "http", "start"]

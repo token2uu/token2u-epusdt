@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -378,6 +379,39 @@ func GetQueueConcurrency() int {
 		return 10
 	}
 	return concurrency
+}
+
+// Conservative defaults keep a single instance within shared RPC capacity.
+func GetSolanaScanInterval() time.Duration {
+	seconds := viper.GetInt("solana_scan_interval_seconds")
+	if seconds <= 0 {
+		seconds = 15
+	}
+	return time.Duration(seconds) * time.Second
+}
+
+func GetSolanaScanConcurrency() int {
+	concurrency := viper.GetInt("solana_scan_concurrency")
+	if concurrency <= 0 {
+		return 2
+	}
+	return concurrency
+}
+
+func GetSolanaRPCInterval() time.Duration {
+	rps := viper.GetFloat64("solana_rpc_requests_per_second")
+	if rps <= 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {
+		rps = 2
+	}
+	intervalNanos := float64(time.Second) / rps
+	if intervalNanos > float64(time.Hour) {
+		return time.Hour
+	}
+	interval := time.Duration(intervalNanos)
+	if interval < time.Millisecond {
+		return time.Millisecond
+	}
+	return interval
 }
 
 // Existing orders retain their persisted mode. This flag affects only newly

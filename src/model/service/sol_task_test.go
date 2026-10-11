@@ -15,6 +15,7 @@ import (
 	"github.com/GMWalletApp/epusdt/model/data"
 	"github.com/GMWalletApp/epusdt/model/mdb"
 	"github.com/GMWalletApp/epusdt/model/request"
+	"github.com/spf13/viper"
 	"github.com/tidwall/gjson"
 )
 
@@ -22,6 +23,9 @@ func setupSolanaRPCNode(t *testing.T, url string) func() {
 	t.Helper()
 
 	cleanup := testutil.SetupTestDatabases(t)
+	// Most scanner tests exercise ledger semantics, not wall-clock throttling.
+	// Throttle tests set their own budget and verify real request spacing.
+	viper.Set("solana_rpc_requests_per_second", 1000)
 	node := &mdb.RpcNode{
 		Network: mdb.NetworkSolana,
 		Url:     url,

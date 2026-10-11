@@ -3,6 +3,7 @@ package task
 import (
 	"sync"
 
+	"github.com/GMWalletApp/epusdt/config"
 	"github.com/GMWalletApp/epusdt/model/data"
 	"github.com/GMWalletApp/epusdt/model/mdb"
 	"github.com/GMWalletApp/epusdt/model/service"
@@ -17,7 +18,7 @@ var gSolanaBlockHeightLock = make(chan struct{}, 1)
 func (r ListenSolJob) Run() {
 	shouldRecordHeight := false
 	func() {
-		// A slow scan must not accumulate another waiting job every 5 seconds.
+		// A slow scan must not accumulate another waiting job on each tick.
 		// The next admitted scan resumes from the persisted payment cursors.
 		if !gListenSolJobLock.TryLock() {
 			log.Sugar.Debug("[ListenSolJob] previous scan still running, skipping")
@@ -43,7 +44,7 @@ func (r ListenSolJob) Run() {
 		}
 		log.Sugar.Infof("[ListenSolJob] Found %d wallet addresses to monitor", len(walletAddress))
 		var wg sync.WaitGroup
-		permits := make(chan struct{}, 8)
+		permits := make(chan struct{}, config.GetSolanaScanConcurrency())
 		for _, address := range walletAddress {
 			log.Sugar.Infof("[ListenSolJob] Listening to address: %s", address.Address)
 			wg.Add(1)

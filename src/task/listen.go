@@ -1,6 +1,9 @@
 package task
 
 import (
+	"fmt"
+
+	"github.com/GMWalletApp/epusdt/config"
 	"github.com/GMWalletApp/epusdt/util/log"
 	"github.com/robfig/cron/v3"
 )
@@ -24,13 +27,14 @@ func Start() {
 	c := cron.New()
 
 	// Solana polling
-	_, err := c.AddJob("@every 5s", ListenSolJob{})
+	solanaSchedule := fmt.Sprintf("@every %s", config.GetSolanaScanInterval())
+	_, err := c.AddJob(solanaSchedule, ListenSolJob{})
 	if err != nil {
 		log.Sugar.Errorf("[task] Failed to add ListenSolJob: %v", err)
 		return
 	}
 
-	log.Sugar.Info("[task] ListenSolJob scheduled successfully (@every 5s)")
+	log.Sugar.Infof("[task] ListenSolJob scheduled successfully (%s)", solanaSchedule)
 
 	// RPC node health checks
 	_, err = c.AddJob("@every 30s", RpcHealthJob{})

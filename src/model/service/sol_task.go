@@ -145,7 +145,7 @@ func SolCallBack(address string, wg *sync.WaitGroup) {
 		for {
 			body, err := SolGetSignaturesForAddress(queryAddr, limit, until, before)
 			if err != nil {
-				log.Sugar.Errorf("[SOL] fetch signatures: %v", err)
+				log.Sugar.Errorf("[SOL] fetch signatures owner=%s account=%s: %v", address, queryAddr, err)
 				return
 			}
 			node := gjson.GetBytes(body, "result")
@@ -441,11 +441,15 @@ func SolRetryClient(method string, params []interface{}) (body []byte, err error
 		lastErr = err
 		failures, cooling := data.RecordRpcNodeFailure(node.ID)
 		nodeLabel := data.RpcNodeLogLabel(*node)
-		if !cooling {
+		var limited *solanaRateLimitError
+		if errors.As(err, &limited) {
+			log.Sugar.Warnf("[SOL] RPC rate limited method=%s node=%s retry_at=%s, trying another node", method, nodeLabel, limited.until.UTC().Format(time.RFC3339))
+		} else if !cooling {
 			log.Sugar.Warnf("[SOL] RPC node failed method=%s node=%s failures=%d/%d", method, nodeLabel, failures, data.RpcFailoverThreshold)
 			return nil, err
+		} else {
+			log.Sugar.Warnf("[SOL] RPC node reached fail threshold method=%s node=%s, trying another node", method, nodeLabel)
 		}
-		log.Sugar.Warnf("[SOL] RPC node reached fail threshold method=%s node=%s, trying another node", method, nodeLabel)
 		tried = append(tried, node.ID)
 	}
 	return nil, lastErr
@@ -456,18 +460,29 @@ func solRetryClientWithURL(rpcUrl string, method string, params []interface{}) (
 }
 
 func solRetryClientWithURLHeaders(rpcUrl string, method string, params []interface{}, headers http.Header) ([]byte, error) {
+	rpcUrl = strings.TrimSpace(rpcUrl)
 	client := resty.New().SetTimeout(20 * time.Second)
+	client.OnBeforeRequest(func(_ *resty.Client, req *resty.Request) error {
+		return solRPCThrottle.wait(req.Context(), rpcUrl)
+	})
 	client.SetRetryCount(solRPCRetryCount)
 	client.SetRetryWaitTime(solRPCRetryWait)
 	client.SetRetryMaxWaitTime(solRPCRetryMaxWait)
 	client.AddRetryCondition(func(r *resty.Response, err error) bool {
+		var limited *solanaRateLimitError
+		if errors.As(err, &limited) || (r != nil && r.StatusCode() == http.StatusTooManyRequests) {
+			return false
+		}
 		if err != nil {
 			return true
 		}
-		if r.StatusCode() >= 429 || r.StatusCode() >= 500 {
-			return true
+		return r != nil && r.StatusCode() >= http.StatusInternalServerError
+	})
+	client.OnAfterResponse(func(_ *resty.Client, resp *resty.Response) error {
+		if resp.StatusCode() == http.StatusTooManyRequests {
+			return solRPCThrottle.rateLimited(rpcUrl, resp.Header().Get("Retry-After"))
 		}
-		return false
+		return nil
 	})
 
 	req := client.R().SetHeader("Content-Type", "application/json")

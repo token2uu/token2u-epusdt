@@ -25,6 +25,7 @@ type solCursorLedger struct {
 	signatures     []solSignatureResult
 	transactions   map[string]interface{}
 	failPagination bool
+	rateLimited    bool
 }
 
 func (l *solCursorLedger) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -44,6 +45,11 @@ func (l *solCursorLedger) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
+	if l.rateLimited {
+		w.Header().Set("Retry-After", "1")
+		w.WriteHeader(http.StatusTooManyRequests)
+		return
+	}
 	var result interface{}
 	switch req.Method {
 	case "getSignaturesForAddress":
@@ -227,6 +233,34 @@ func TestSolCursorPaginationRetriesBeforeAdvancing(t *testing.T) {
 	clearProcessedSignatures()
 	scanSolCursor()
 	assertSolCursor(t, l, "new-0999")
+	assertSolCursorSettlement(t, o)
+}
+
+func TestSolCursorRecoversPaymentAfterRPCRateLimit(t *testing.T) {
+	l := setupSolCursorLedger(t)
+	isolateSolThrottle(t, 1000)
+	l.add("A", 1, "")
+	if err := data.SavePaymentCursor("solana:signatures:"+l.ata, "A"); err != nil {
+		t.Fatal(err)
+	}
+	o := solCursorOrder(t)
+	l.add("B", 2, "3000000")
+	l.rateLimited = true
+	scanSolCursor()
+	assertSolCursor(t, l, "A")
+	var receipts int64
+	if err := dao.Mdb.Model(&mdb.PaymentReceipt{}).Count(&receipts).Error; err != nil || receipts != 0 {
+		t.Fatalf("rate-limited scan wrote receipts: %d, %v", receipts, err)
+	}
+	l.mu.Lock()
+	l.rateLimited = false
+	l.mu.Unlock()
+	// Retry-After is one second; the next scan must resume the same cursor.
+	time.Sleep(1100 * time.Millisecond)
+	scanSolCursor()
+	assertSolCursor(t, l, "B")
+	assertSolCursorSettlement(t, o)
+	scanSolCursor()
 	assertSolCursorSettlement(t, o)
 }
 

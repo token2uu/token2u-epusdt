@@ -489,10 +489,14 @@ func TestSolCallBackDoesNotCacheSignatureAfterRetryableOrderProcessingError(t *t
 	SolCallBack(address, &wg)
 	wg.Wait()
 
+	cursor, err := data.LoadPaymentCursor("solana:signatures:" + address)
+	if err != nil || cursor != "" {
+		t.Fatalf("failed scan advanced cursor: %q %v", cursor, err)
+	}
 	if calls != 1 {
 		t.Fatalf("order processing calls = %d, want 1", calls)
 	}
-	if _, ok := gProcessedSignatures.Load(sig); ok {
+	if _, ok := gProcessedSignatures.Load(address + ":" + sig); ok {
 		t.Fatalf("signature %s was cached after retryable order processing error", sig)
 	}
 }

@@ -81,6 +81,9 @@ func safeRun(name string, fn func()) {
 }
 
 func processExpiredOrders() {
+	if err := data.ExpireExclusivePayments(); err != nil {
+		log.Sugar.Errorf("[mq] exclusive expiration: %v", err)
+	}
 	expirationCutoff := time.Now().Add(-config.GetOrderExpirationTimeDuration())
 	for {
 		var orders []expirableOrder
@@ -88,6 +91,7 @@ func processExpiredOrders() {
 			return dao.Mdb.Model(&mdb.Orders{}).
 				Select("id", "trade_id", "status", "network", "receive_address", "token", "actual_amount", "pay_provider").
 				Where("status IN ?", []int{mdb.StatusWaitPay, mdb.StatusWaitSelect}).
+				Where("collection_mode <> ?", mdb.CollectionExclusive).
 				Where("created_at <= ?", expirationCutoff).
 				Order("id asc").
 				Limit(batchSize).

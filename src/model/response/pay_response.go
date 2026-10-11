@@ -1,6 +1,11 @@
 package response
 
 type CheckoutCounterResponse struct {
+	CollectionMode   string  `json:"collection_mode"`
+	MinimumPayment   string  `json:"minimum_payment"`
+	PaidCryptoAmount string  `json:"paid_crypto_amount"`
+	PaidAmount       float64 `json:"paid_amount"`
+
 	TradeId        string  `json:"trade_id" example:"3nQ9pL2xV7sK1mR8cT4yB_aZ"`                                     //  epusdt订单号
 	Amount         float64 `json:"amount" example:"100.0000"`                                                       //  订单金额，按 system.amount_precision 保留小数 法币金额
 	ActualAmount   float64 `json:"actual_amount" example:"14.2857"`                                                 //  订单实际需要支付的金额；status=4 占位订单返回 0

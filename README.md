@@ -1,5 +1,7 @@
 # Epusdt — Easy Payment USDT
 
+本分支新增 [EPay 独占地址、按实付结算（单实例）](docs/address-collection.md)，包含地址轮询、异常到账记录和回调兼容说明。
+
 <p align="center">
   <img src="https://gmwallet.app/favicon.png" alt="Epusdt Logo - Multi-chain Crypto Payment Gateway" width="120">
 </p>

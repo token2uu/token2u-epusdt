@@ -113,7 +113,7 @@ func runEthereumListener(contracts []common.Address) {
 			blockTsMs = int64(header.Time) * 1000
 		}
 
-		service.TryProcessEvmERC20Transfer(mdb.NetworkEthereum, vLog.Address, toAddr, amount, vLog.TxHash.Hex(), blockTsMs)
+		service.TryProcessEvmERC20Transfer(mdb.NetworkEthereum, vLog.Address, toAddr, amount, vLog.TxHash.Hex(), blockTsMs, vLog.Index)
 	})
 }
 

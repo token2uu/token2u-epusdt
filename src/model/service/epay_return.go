@@ -105,7 +105,7 @@ func BuildEPayResultParams(order *mdb.Orders, apiKeyRow *mdb.ApiKey) (map[string
 		Money:       fmt.Sprintf("%.4f", order.Amount),
 		TradeStatus: tradeStatus,
 	}
-	if order.PaidAmount > 0 && !data.IsPackageEpayNotifyURL(order.NotifyUrl) {
+	if order.PaidAmount > 0 && (order.CollectionMode == mdb.CollectionExclusive || !data.IsPackageEpayNotifyURL(order.NotifyUrl)) {
 		notifyData.PaidMoney = fmt.Sprintf("%.4f", order.PaidAmount)
 	}
 

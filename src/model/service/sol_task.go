@@ -7,6 +7,7 @@ import (
 	"math/big"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -103,43 +104,94 @@ func SolCallBack(address string, wg *sync.WaitGroup) {
 		queryAddrs = append(queryAddrs, ata)
 	}
 
-	// 拉取签名并去重
+	// Each watched owner/ATA has a durable high-water signature. Advance all
+	// cursors only after every fetched transaction is durably processed.
+	cutoffTime := time.Now().Add(-config.GetOrderExpirationTimeDuration() - 5*time.Minute).Unix()
 	seen := make(map[string]bool)
 	var result []solSignatureResult
+	nextCursors := make(map[string]string)
+	allProcessed := true
 	for _, queryAddr := range queryAddrs {
-		respBody, err := SolGetSignaturesForAddress(queryAddr, limit, "", "")
+		key := "solana:signatures:" + queryAddr
+		until, err := data.LoadPaymentCursor(key)
 		if err != nil {
-			log.Sugar.Errorf("[SOL][%s] SolGetSignaturesForAddress(%s) failed: %v", address, queryAddr, err)
-			continue
+			log.Sugar.Errorf("[SOL] load cursor: %v", err)
+			return
 		}
-
-		resultBody := gjson.GetBytes(respBody, "result")
-		if !resultBody.Exists() || !resultBody.IsArray() {
-			log.Sugar.Errorf("[SOL][%s] unexpected response format for %s: %s", address, queryAddr, string(respBody))
-			continue
-		}
-
-		var batch []solSignatureResult
-		err = json.Unmarshal([]byte(resultBody.Raw), &batch)
-		if err != nil {
-			log.Sugar.Errorf("[SOL][%s] failed to unmarshal signatures for %s: %v", address, queryAddr, err)
-			continue
-		}
-
-		for _, sig := range batch {
-			if !seen[sig.Signature] {
-				seen[sig.Signature] = true
-				result = append(result, sig)
+		queryCutoffTime := cutoffTime
+		if until == "" {
+			// Freeze the initial lookback while retrying. Otherwise a payment
+			// with incomplete details can age out before the first cursor commits.
+			startKey := key + ":start_time"
+			start, err := data.LoadPaymentCursor(startKey)
+			if err != nil {
+				log.Sugar.Errorf("[SOL] load initial scan boundary: %v", err)
+				return
 			}
+			if start == "" {
+				if err := data.SavePaymentCursor(startKey, strconv.FormatInt(queryCutoffTime, 10)); err != nil {
+					log.Sugar.Errorf("[SOL] save initial scan boundary: %v", err)
+					return
+				}
+			} else {
+				queryCutoffTime, err = strconv.ParseInt(start, 10, 64)
+				if err != nil || queryCutoffTime <= 0 {
+					log.Sugar.Errorf("[SOL] invalid initial scan boundary for %s: %q", queryAddr, start)
+					return
+				}
+			}
+		}
+		before := ""
+		for {
+			body, err := SolGetSignaturesForAddress(queryAddr, limit, until, before)
+			if err != nil {
+				log.Sugar.Errorf("[SOL] fetch signatures: %v", err)
+				return
+			}
+			node := gjson.GetBytes(body, "result")
+			if !node.IsArray() {
+				log.Sugar.Error("[SOL] invalid signature response")
+				return
+			}
+			var batch []solSignatureResult
+			if err := json.Unmarshal([]byte(node.Raw), &batch); err != nil {
+				return
+			}
+			if len(batch) == 0 {
+				break
+			}
+			if before == "" {
+				nextCursors[key] = batch[0].Signature
+			}
+			reachedStart := false
+			for _, sig := range batch {
+				if until == "" && sig.BlockTime != nil && *sig.BlockTime < queryCutoffTime {
+					reachedStart = true
+					continue
+				}
+				if !seen[sig.Signature] {
+					seen[sig.Signature] = true
+					result = append(result, sig)
+				}
+			}
+			if len(batch) < limit || reachedStart {
+				break
+			}
+			next := batch[len(batch)-1].Signature
+			if next == before {
+				log.Sugar.Error("[SOL] signature pagination stalled")
+				return
+			}
+			before = next
 		}
 	}
 
 	if len(result) == 0 {
 		log.Sugar.Debugf("[SOL][%s] no transaction signatures found", address)
-		return
 	}
 
-	// 按 blockTime 降序排列
+	// Process oldest signatures first.
+	// 按 blockTime 排列
 	sort.Slice(result, func(i, j int) bool {
 		if result[i].BlockTime == nil {
 			return false
@@ -147,11 +199,8 @@ func SolCallBack(address string, wg *sync.WaitGroup) {
 		if result[j].BlockTime == nil {
 			return true
 		}
-		return *result[i].BlockTime > *result[j].BlockTime
+		return result[i].Slot < result[j].Slot
 	})
-
-	// 时间截止线：订单过期时间 + 5 分钟
-	cutoffTime := time.Now().Add(-config.GetOrderExpirationTimeDuration() - 5*time.Minute).Unix()
 
 	log.Sugar.Debugf("[SOL][%s] fetched %d unique signatures from %d addresses, cutoff=%d",
 		address, len(result), len(queryAddrs), cutoffTime)
@@ -166,15 +215,8 @@ func SolCallBack(address string, wg *sync.WaitGroup) {
 			continue
 		}
 
-		// 超过截止时间的旧签名不再处理
-		if txSig.BlockTime != nil && *txSig.BlockTime < cutoffTime {
-			log.Sugar.Debugf("[SOL][%s] [%d/%d] sig=%s blockTime=%d before cutoff=%d, stopping scan",
-				address, sigIdx+1, len(result), sig, *txSig.BlockTime, cutoffTime)
-			break
-		}
-
 		// 跳过已处理的签名
-		if _, ok := gProcessedSignatures.Load(sig); ok {
+		if _, ok := gProcessedSignatures.Load(address + ":" + sig); ok {
 			continue
 		}
 
@@ -183,22 +225,18 @@ func SolCallBack(address string, wg *sync.WaitGroup) {
 		txData, err := SolGetTransaction(sig)
 		if err != nil {
 			log.Sugar.Debugf("[SOL][%s] sig=%s fetch failed: %v", address, sig, err)
+			allProcessed = false
 			continue
 		}
 
-		instructions := gjson.GetBytes(txData, "result.transaction.message.instructions").Array()
-		log.Sugar.Debugf("[SOL][%s] sig=%s has %d instructions", address, sig, len(instructions))
+		transfers, err := parseSolTransactionTransfers(txData, queryAddrs)
+		if err != nil {
+			allProcessed = false
+			log.Sugar.Warnf("[SOL][%s] sig=%s incomplete transaction, retaining cursor: %v", address, sig, err)
+			continue
+		}
 
-		for instrIdx, instruction := range instructions {
-			programID := instruction.Get("programId").String()
-			parsedType := instruction.Get("parsed.type").String()
-			log.Sugar.Debugf("[SOL][%s] sig=%s instr[%d] programId=%s parsedType=%s", address, sig, instrIdx, programID, parsedType)
-
-			transferInfo, err := ParseTransferInfoFromInstruction(instruction, txData)
-			if err != nil {
-				log.Sugar.Debugf("[SOL][%s] sig=%s instr[%d] parse error: %v", address, sig, instrIdx, err)
-				continue
-			}
+		for instrIdx, transferInfo := range transfers {
 			if transferInfo == nil {
 				continue
 			}
@@ -212,6 +250,35 @@ func SolCallBack(address string, wg *sync.WaitGroup) {
 				continue
 			}
 
+			cfg := mintTokens[transferInfo.Mint]
+			assetID := transferInfo.Mint
+			if transferInfo.Mint == "SOL" {
+				cfg = nativeSolToken
+				assetID = ""
+			}
+			symbol := ""
+			decimals := 6
+			if cfg != nil {
+				symbol = cfg.Symbol
+				decimals = cfg.Decimals
+			}
+			if transferInfo.Decimals != nil {
+				decimals = *transferInfo.Decimals
+			}
+			if transferInfo.Mint == "SOL" {
+				decimals = 9
+			}
+			handled, collectionErr := processExclusivePayment(data.ObservedPayment{Network: mdb.NetworkSolana, Address: address,
+				Token: symbol, AssetID: assetID, RawAmount: new(big.Int).SetUint64(transferInfo.RawAmount), Decimals: decimals,
+				TxHash: sig, EventID: fmt.Sprintf("instruction:%d", instrIdx), BlockTimeMs: transferInfo.BlockTime * 1000})
+			if collectionErr != nil {
+				retrySignature = true
+				log.Sugar.Errorf("[SOL] collection: %v", collectionErr)
+				continue
+			}
+			if handled {
+				continue
+			}
 			token, amount := resolveSolTokenAndAmount(transferInfo, mintTokens, nativeSolToken)
 			if token == "" || amount <= 0 {
 				continue
@@ -290,12 +357,21 @@ func SolCallBack(address string, wg *sync.WaitGroup) {
 		}
 
 		if retrySignature {
+			allProcessed = false
 			log.Sugar.Debugf("[SOL][%s] sig=%s not marked processed because retryable processing failed", address, sig)
 			continue
 		}
 
 		// 标记已处理
-		gProcessedSignatures.Store(sig, time.Now().Unix())
+		gProcessedSignatures.Store(address+":"+sig, time.Now().Unix())
+	}
+	if allProcessed {
+		for key, sig := range nextCursors {
+			if err := data.SavePaymentCursor(key, sig); err != nil {
+				log.Sugar.Errorf("[SOL] save cursor: %v", err)
+				return
+			}
+		}
 	}
 }
 
@@ -380,7 +456,7 @@ func solRetryClientWithURL(rpcUrl string, method string, params []interface{}) (
 }
 
 func solRetryClientWithURLHeaders(rpcUrl string, method string, params []interface{}, headers http.Header) ([]byte, error) {
-	client := resty.New()
+	client := resty.New().SetTimeout(20 * time.Second)
 	client.SetRetryCount(solRPCRetryCount)
 	client.SetRetryWaitTime(solRPCRetryWait)
 	client.SetRetryMaxWaitTime(solRPCRetryMaxWait)
@@ -427,6 +503,8 @@ func solRetryClientWithURLHeaders(rpcUrl string, method string, params []interfa
 	return respBody, nil
 }
 
+// SolGetSignaturesForAddress returns newest-first signatures newer than untilSig.
+// beforeSig paginates backwards within that range; keep untilSig fixed across pages.
 func SolGetSignaturesForAddress(address string, limit int, untilSig string, beforeSig string) ([]byte, error) {
 	opts := map[string]interface{}{
 		"commitment": "finalized",
@@ -490,7 +568,7 @@ func SolGetTransaction(sig string) ([]byte, error) {
 		sig,
 		map[string]interface{}{
 			"encoding":                       "jsonParsed",
-			"commitment":                     "confirmed",
+			"commitment":                     "finalized",
 			"maxSupportedTransactionVersion": 0, // suport
 		},
 	})
@@ -517,7 +595,7 @@ func solGetTransactionWithURLHeaders(rpcURL string, sig string, headers http.Hea
 		sig,
 		map[string]interface{}{
 			"encoding":                       "jsonParsed",
-			"commitment":                     "confirmed",
+			"commitment":                     "finalized",
 			"maxSupportedTransactionVersion": 0, // suport
 		},
 	}, headers)
@@ -716,7 +794,7 @@ func parseSystemTransfer(instruction gjson.Result, txData []byte) (*TransferInfo
 	}, nil
 }
 
-// parseSplTransfer 解析 SPL Token "transfer" 指令，mint 从 postTokenBalances 中查找
+// parseSplTransfer resolves unchecked transfers using validated pre/post balances.
 func parseSplTransfer(instruction gjson.Result, txData []byte) (*TransferInfo, error) {
 	info := instruction.Get("parsed.info")
 	source := info.Get("source").String()
@@ -729,14 +807,9 @@ func parseSplTransfer(instruction gjson.Result, txData []byte) (*TransferInfo, e
 		return nil, fmt.Errorf("invalid amount: %s", amountStr)
 	}
 
-	// Look up mint and decimals from postTokenBalances using the destination ATA
-	mint, decimals, found := findMintFromTokenBalances(destination, txData)
-	if !found {
-		// Try source ATA as fallback
-		mint, decimals, found = findMintFromTokenBalances(source, txData)
-	}
-	if !found {
-		return nil, fmt.Errorf("could not determine mint for transfer: source=%s dest=%s", source, destination)
+	mint, decimals, err := resolveSplTransferAsset(source, destination, txData)
+	if err != nil {
+		return nil, err
 	}
 
 	d := decimals
@@ -775,29 +848,4 @@ func parseSplTransferChecked(instruction gjson.Result, txData []byte) (*Transfer
 		Decimals:    &decimals,
 		BlockTime:   blockTime,
 	}, nil
-}
-
-// findMintFromTokenBalances 从 postTokenBalances 中查找 ATA 对应的 mint 和 decimals
-func findMintFromTokenBalances(ataAddress string, txData []byte) (string, int, bool) {
-	accountKeys := gjson.GetBytes(txData, "result.transaction.message.accountKeys").Array()
-	accountIndex := -1
-	for i, key := range accountKeys {
-		if key.Get("pubkey").String() == ataAddress {
-			accountIndex = i
-			break
-		}
-	}
-	if accountIndex == -1 {
-		return "", 0, false
-	}
-
-	balances := gjson.GetBytes(txData, "result.meta.postTokenBalances").Array()
-	for _, balance := range balances {
-		if int(balance.Get("accountIndex").Int()) == accountIndex {
-			mint := balance.Get("mint").String()
-			decimals := int(balance.Get("uiTokenAmount.decimals").Int())
-			return mint, decimals, true
-		}
-	}
-	return "", 0, false
 }

@@ -54,6 +54,8 @@ func resolveEPayTypeSelector(rawType string) (string, string, bool, error) {
 
 // RegisterRoute 路由注册
 func RegisterRoute(e *echo.Echo) {
+	e.GET("/admin/collections", admin.Ctrl.CollectionConsole)
+	e.GET("/admin/collection-tools.js", admin.Ctrl.CollectionTools)
 	e.POST("/", func(c echo.Context) error {
 		return c.String(http.StatusOK, "hello epusdt, https://github.com/GMwalletApp/epusdt")
 	})
@@ -318,6 +320,9 @@ func registerAdminRoutes(e *echo.Echo) {
 	authed.POST("/wallets/batch-import", admin.Ctrl.AdminBatchImportWallets)
 
 	// Orders
+	authed.GET("/payment-receipts", admin.Ctrl.ListPaymentReceipts)
+	authed.POST("/payment-receipts/:id/resolve", admin.Ctrl.ResolvePaymentReceipt)
+	authed.GET("/payment-addresses", admin.Ctrl.ListPaymentAddresses)
 	authed.GET("/orders", admin.Ctrl.ListOrders)
 	authed.GET("/orders/export", admin.Ctrl.ExportOrders)
 	authed.GET("/orders/list-with-sub", admin.Ctrl.ListOrdersWithSub)

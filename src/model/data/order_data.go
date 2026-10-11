@@ -209,7 +209,8 @@ func OrderSuccessWithPaidAmount(tx *gorm.DB, req *request.OrderProcessingRequest
 		return false, nil
 	}
 
-	order, err := GetOrderInfoByTradeId(req.TradeId)
+	order := new(mdb.Orders)
+	err := tx.Where("trade_id = ?", req.TradeId).First(order).Error
 	if err != nil {
 		return false, err
 	}
@@ -412,7 +413,7 @@ func CompleteWaitSelectOkPayOrderWithTransaction(tx *gorm.DB, tradeID string, to
 			"actual_amount":   actualAmount,
 			"is_selected":     false,
 			"pay_provider":    mdb.PaymentProviderOkPay,
-			"created_at":      time.Now(),
+			"created_at":      gorm.Expr("CASE WHEN collection_mode = ? THEN created_at ELSE ? END", mdb.CollectionExclusive, time.Now()),
 		})
 	return result.RowsAffected > 0, result.Error
 }
@@ -428,7 +429,7 @@ func MarkProviderSwitchParentSelectedWithTransaction(tx *gorm.DB, tradeID string
 		Updates(map[string]interface{}{
 			"status":      mdb.StatusWaitPay,
 			"is_selected": true,
-			"created_at":  time.Now(),
+			"created_at":  gorm.Expr("CASE WHEN collection_mode = ? THEN created_at ELSE ? END", mdb.CollectionExclusive, time.Now()),
 		})
 	return result.RowsAffected > 0, result.Error
 }
@@ -449,7 +450,7 @@ func ExpireOrderByTradeID(tradeId string) error {
 // Called on the parent order when a sub-order is created or returned.
 func RefreshOrderExpiration(tradeId string) error {
 	return dao.Mdb.Model(&mdb.Orders{}).
-		Where("trade_id = ?", tradeId).
+		Where("trade_id = ? AND collection_mode <> ?", tradeId, mdb.CollectionExclusive).
 		Update("created_at", time.Now()).Error
 }
 

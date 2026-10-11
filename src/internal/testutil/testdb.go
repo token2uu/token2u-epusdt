@@ -22,6 +22,8 @@ func SetupTestDatabases(t testing.TB) func() {
 	t.Helper()
 
 	viper.Reset()
+	// Existing fixtures exercise the legacy amount-lock protocol.
+	viper.Set("epay_exclusive_addresses", false)
 	viper.Set("app_uri", "https://example.com")
 	viper.Set("order_expiration_time", 10)
 	viper.Set("order_notice_max_retry", 2)
@@ -39,6 +41,7 @@ func SetupTestDatabases(t testing.TB) func() {
 
 	mustMigrate(t, mainDB,
 		&mdb.Orders{},
+		&mdb.PaymentAddress{}, &mdb.PaymentReceipt{}, &mdb.PaymentScanCursor{},
 		&mdb.ProviderOrder{},
 		&mdb.WalletAddress{},
 		&mdb.ApiKey{},

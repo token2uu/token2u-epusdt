@@ -135,6 +135,7 @@ func appendAptosObservedTransfer(out *[]MoveObservedTransfer, txID string, versi
 	}
 	*out = append(*out, MoveObservedTransfer{
 		Network:        mdb.NetworkAptos,
+		AssetID:        event.token.ContractAddress,
 		ReceiveAddress: recipient,
 		Token:          NormalizeAptosPaymentSymbol(event.token.Symbol),
 		RawAmount:      event.rawAmount,

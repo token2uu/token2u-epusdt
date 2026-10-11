@@ -2,7 +2,9 @@ package task
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"strconv"
 	"sync"
 	"time"
 
@@ -19,6 +21,7 @@ const (
 )
 
 type aptosRuntimeCursor struct {
+	persistent      bool
 	initialized     bool
 	lastSeenVersion int64
 }
@@ -51,7 +54,7 @@ var (
 
 func StartAptosLedgerScannerListener() {
 	provider := serviceAptosProvider{}
-	cursor := &aptosRuntimeCursor{}
+	cursor := &aptosRuntimeCursor{persistent: true}
 	log.Sugar.Infof("[APTOS] ledger scanner starting mode=full_ledger chunk_size=%d workers=%d queue_limit=%d",
 		aptosLedgerChunkSize,
 		aptosLedgerWorkerCount,
@@ -102,11 +105,30 @@ func runAptosLedgerScanner(ctx context.Context, provider aptosChainProvider, cur
 		}
 		data.RecordRpcBlockHeight(mdb.NetworkAptos, latest)
 		confirmed := moveConfirmedCursor(latest, chain.MinConfirmations)
+		if !cursor.initialized && cursor.persistent {
+			saved, err := data.LoadPaymentCursor("aptos:ledger")
+			if err != nil {
+				return err
+			}
+			if saved != "" {
+				cursor.lastSeenVersion, err = strconv.ParseInt(saved, 10, 64)
+				if err != nil {
+					return err
+				}
+				cursor.initialized = true
+			}
+		}
 		if !cursor.initialized {
 			cursor.initialized = true
 			cursor.lastSeenVersion = confirmed - aptosLedgerChunkSize
 			if cursor.lastSeenVersion < -1 {
 				cursor.lastSeenVersion = -1
+			}
+			if cursor.persistent {
+				if err := data.SavePaymentCursor("aptos:ledger", strconv.FormatInt(cursor.lastSeenVersion, 10)); err != nil {
+					cursor.initialized = false
+					return err
+				}
 			}
 			log.Sugar.Infof(
 				"[APTOS] initialized ledger cursor at version=%d confirmed_head=%d chunk_size=%d mode=full_ledger_watch",
@@ -181,7 +203,13 @@ func processAptosLedgerRound(ctx context.Context, provider aptosChainProvider, s
 		if err := errByStart[item.start]; err != nil {
 			return cursor.lastSeenVersion < confirmedVersion, err
 		}
-		cursor.lastSeenVersion = item.start + item.limit - 1
+		next := item.start + item.limit - 1
+		if cursor.persistent {
+			if err := data.SavePaymentCursor("aptos:ledger", strconv.FormatInt(next, 10)); err != nil {
+				return true, err
+			}
+		}
+		cursor.lastSeenVersion = next
 	}
 	return cursor.lastSeenVersion < confirmedVersion, nil
 }
@@ -214,6 +242,11 @@ func processAptosLedgerRange(ctx context.Context, provider aptosChainProvider, i
 	if err != nil {
 		return fmt.Errorf("get transactions start=%d limit=%d: %w", item.start, item.limit, err)
 	}
+	// Validate the whole ledger range before applying any payment. A successful
+	// HTTP response (including [] or a short page) does not prove full coverage.
+	if err := validateAptosLedgerBatch(body, item.start, item.limit); err != nil {
+		return fmt.Errorf("validate transactions start=%d limit=%d: %w", item.start, item.limit, err)
+	}
 	transfers, err := parseAptosTransfersForWallets(body, item.state.wallets, item.state.tokens)
 	if err != nil {
 		return fmt.Errorf("parse transactions start=%d limit=%d: %w", item.start, item.limit, err)
@@ -245,6 +278,32 @@ func processAptosLedgerRange(ctx context.Context, provider aptosChainProvider, i
 		)
 	}
 	return nil
+}
+
+func validateAptosLedgerBatch(body []byte, start, limit int64) error {
+	// Check all committed transaction types, not only successful user transfers:
+	// block metadata, checkpoints and failed transactions also occupy versions.
+	var transactions []struct {
+		Version string `json:"version"`
+	}
+	if err := json.Unmarshal(body, &transactions); err != nil {
+		return fmt.Errorf("invalid transaction array: %w", err)
+	}
+	if int64(len(transactions)) != limit {
+		return fmt.Errorf("incomplete ledger range: got %d transactions, want %d", len(transactions), limit)
+	}
+	for i, transaction := range transactions {
+		// Aptos REST encodes u64 versions as strings. Avoid floating-point
+		// conversion so large versions cannot silently lose integer precision.
+		version, err := strconv.ParseUint(transaction.Version, 10, 64)
+		if err != nil {
+			return fmt.Errorf("invalid version at index %d: %w", i, err)
+		}
+		if version != uint64(start)+uint64(i) {
+			return fmt.Errorf("non-contiguous ledger range at index %d: got version %d, want %d", i, version, uint64(start)+uint64(i))
+		}
+	}
+	return validateAptosLedgerContents(body)
 }
 
 func chooseAptosIdleDelay(catchup bool, interval time.Duration) time.Duration {

@@ -21,6 +21,7 @@ var gProcessedMoveTx sync.Map // transfer-level key -> unix timestamp
 var processMoveOrder = OrderProcessing
 
 type MoveObservedTransfer struct {
+	AssetID        string
 	Network        string
 	ReceiveAddress string
 	Token          string
@@ -35,6 +36,12 @@ type MoveObservedTransfer struct {
 }
 
 func ProcessMoveObservedTransferResult(transfer MoveObservedTransfer) error {
+	handled, collectionErr := processExclusivePayment(data.ObservedPayment{Network: transfer.Network, Address: transfer.ReceiveAddress,
+		Token: transfer.Token, AssetID: transfer.AssetID, RawAmount: transfer.RawAmount, Decimals: transfer.Decimals,
+		TxHash: transfer.TxID, EventID: MoveTransferCacheKey(transfer), BlockTimeMs: transfer.BlockTimeMs})
+	if collectionErr != nil || handled {
+		return collectionErr
+	}
 	net := moveLogLabel(transfer.Network)
 	cacheKey := MoveTransferCacheKey(transfer)
 	now := time.Now().Unix()

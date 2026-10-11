@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -48,6 +49,7 @@ func (s *tonWatchState) hasWalletInWorkchain(workchain int32) bool {
 }
 
 type tonRuntimeCursor struct {
+	persistent      bool
 	initialized     bool
 	lastMasterSeqNo uint32
 	shardSeqNo      map[string]uint32
@@ -71,7 +73,7 @@ func newTonJettonWalletCache() *tonJettonWalletCache {
 // StartTonBlockScannerListener runs a forward-only TON masterchain scanner.
 func StartTonBlockScannerListener() {
 	cache := newTonJettonWalletCache()
-	cursor := &tonRuntimeCursor{}
+	cursor := &tonRuntimeCursor{persistent: true}
 	for {
 		chain, interval := tonChainConfig()
 		if chain == nil || !chain.Enabled {
@@ -184,6 +186,11 @@ func runTonScanner(ctx context.Context, api ton.APIClientWrapped, cache *tonJett
 				data.RecordRpcFailure(mdb.NetworkTon)
 				return fmt.Errorf("process masterchain seqno=%d: %w", seq, err)
 			}
+			if cursor.persistent {
+				if err := data.SavePaymentCursor("ton:master", strconv.FormatUint(uint64(master.SeqNo), 10)); err != nil {
+					return err
+				}
+			}
 			cursor.lastMasterSeqNo = master.SeqNo
 			data.RecordRpcSuccess(mdb.NetworkTon)
 			data.RecordRpcBlockHeight(mdb.NetworkTon, int64(seq))
@@ -214,6 +221,19 @@ func initializeTonRuntimeCursor(ctx context.Context, api ton.APIClientWrapped, h
 	if head == nil {
 		return fmt.Errorf("current masterchain head is nil")
 	}
+	if cursor.persistent {
+		saved, err := data.LoadPaymentCursor("ton:master")
+		if err != nil {
+			return err
+		}
+		if saved != "" {
+			n, err := strconv.ParseUint(saved, 10, 32)
+			if err != nil {
+				return err
+			}
+			confirmedHeadSeqNo = uint32(n)
+		}
+	}
 	initMaster := head
 	if confirmedHeadSeqNo > 0 && confirmedHeadSeqNo != head.SeqNo {
 		var err error
@@ -225,6 +245,11 @@ func initializeTonRuntimeCursor(ctx context.Context, api ton.APIClientWrapped, h
 	if confirmedHeadSeqNo > 0 {
 		if err := initializeTonShardCursors(ctx, api, initMaster, cursor); err != nil {
 			return fmt.Errorf("initialize shard cursors masterchain seqno=%d: %w", initMaster.SeqNo, err)
+		}
+	}
+	if cursor.persistent {
+		if err := data.SavePaymentCursor("ton:master", strconv.FormatUint(uint64(confirmedHeadSeqNo), 10)); err != nil {
+			return err
 		}
 	}
 	cursor.initialized = true
@@ -386,7 +411,9 @@ func processTonShardBlock(ctx context.Context, api ton.APIClientWrapped, master,
 				)
 				continue
 			}
-			service.TryProcessTonTransfer(transfer)
+			if err := service.ProcessTonTransfer(transfer); err != nil {
+				return err
+			}
 		}
 		if !incomplete {
 			return nil

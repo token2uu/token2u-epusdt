@@ -8,6 +8,7 @@ import (
 	"io"
 	"math/big"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -195,11 +196,10 @@ func GetBlockByNum(baseURL string, apiKey string, num int64) (*Block, error) {
 	return &block, nil
 }
 
-func loadTronTRC20TokenMap() map[string]mdb.ChainToken {
+func loadTronTRC20TokenMap() (map[string]mdb.ChainToken, error) {
 	tokens, err := data.ListEnabledChainTokensByNetwork(mdb.NetworkTron)
 	if err != nil {
-		log.Sugar.Warnf("[TRON-BLOCK] load chain_tokens: %v", err)
-		return nil
+		return nil, err
 	}
 	tokenMap := make(map[string]mdb.ChainToken)
 	for _, token := range tokens {
@@ -215,7 +215,7 @@ func loadTronTRC20TokenMap() map[string]mdb.ChainToken {
 		}
 		tokenMap[contractHex] = token
 	}
-	return tokenMap
+	return tokenMap, nil
 }
 
 func parseTRC20Transfer(tx Transaction, tokenMap map[string]mdb.ChainToken) *TRC20Transfer {
@@ -328,23 +328,28 @@ func parseTRXTransfer(tx Transaction) *TRXTransfer {
 	}
 }
 
-func processBlock(block *Block, tokenMap map[string]mdb.ChainToken) {
+func processBlock(block *Block, tokenMap map[string]mdb.ChainToken) error {
 	blockTsMs := block.BlockHeader.RawData.Timestamp
 	for _, tx := range block.Transactions {
 		if t := parseTRC20Transfer(tx, tokenMap); t != nil {
 			if t.Status != "SUCCESS" {
 				continue
 			}
-			service.TryProcessTronTRC20Transfer(t.Token, t.To, t.Raw, t.TxID, blockTsMs)
+			if err := service.ProcessTronTRC20Transfer(t.Token, t.To, t.Raw, t.TxID, blockTsMs); err != nil {
+				return err
+			}
 			continue
 		}
 		if t := parseTRXTransfer(tx); t != nil {
 			if t.Status != "SUCCESS" {
 				continue
 			}
-			service.TryProcessTronTRXTransfer(t.To, t.RawSun, t.TxID, blockTsMs)
+			if err := service.ProcessTronTRXTransfer(t.To, t.RawSun, t.TxID, blockTsMs); err != nil {
+				return err
+			}
 		}
 	}
+	return nil
 }
 
 type Scanner struct {
@@ -377,6 +382,30 @@ func (s *Scanner) Init() error {
 		return fmt.Errorf("获取初始块失败: %w", err)
 	}
 	s.lastBlock = block.BlockHeader.RawData.Number
+	saved, err := data.LoadPaymentCursor("tron:blocks")
+	if err != nil {
+		return err
+	}
+	if saved != "" {
+		s.lastBlock, err = strconv.ParseInt(saved, 10, 64)
+		if err != nil {
+			return fmt.Errorf("invalid tron cursor: %w", err)
+		}
+	} else {
+		// Start behind the confirmation window so initialization cannot skip
+		// newly assigned payments awaiting confirmation.
+		if chain, err := data.GetChainByNetwork(mdb.NetworkTron); err != nil {
+			return err
+		} else if chain != nil {
+			s.lastBlock -= int64(chain.MinConfirmations)
+		}
+		if s.lastBlock < 0 {
+			s.lastBlock = 0
+		}
+		if err := data.SavePaymentCursor("tron:blocks", strconv.FormatInt(s.lastBlock, 10)); err != nil {
+			return err
+		}
+	}
 	log.Sugar.Infof("[TRON-BLOCK] start block=%d", s.lastBlock)
 	return nil
 }
@@ -414,16 +443,28 @@ func (s *Scanner) poll() {
 		return
 	}
 	latestNum := latest.BlockHeader.RawData.Number
+	chain, err := data.GetChainByNetwork(mdb.NetworkTron)
+	if err != nil {
+		log.Sugar.Errorf("[TRON-BLOCK] load chain: %v", err)
+		return
+	}
+	if chain != nil && chain.MinConfirmations > 1 {
+		latestNum -= int64(chain.MinConfirmations - 1)
+	}
 	if latestNum <= s.lastBlock {
 		data.RecordRpcNodeSuccess(s.nodeID)
 		return
 	}
 
-	tokenMap := loadTronTRC20TokenMap()
+	tokenMap, err := loadTronTRC20TokenMap()
+	if err != nil {
+		log.Sugar.Errorf("[TRON-BLOCK] tokens: %v", err)
+		return
+	}
 	hadBlockFetchError := false
 	for num := s.lastBlock + 1; num <= latestNum; num++ {
 		var block *Block
-		if num == latestNum {
+		if num == latest.BlockHeader.RawData.Number {
 			block = latest
 		} else {
 			block, err = GetBlockByNum(s.baseURL, s.apiKey, num)
@@ -434,7 +475,18 @@ func (s *Scanner) poll() {
 			}
 			time.Sleep(200 * time.Millisecond)
 		}
-		processBlock(block, tokenMap)
+		if block.BlockHeader.RawData.Number != num || block.BlockHeader.RawData.Timestamp <= 0 {
+			log.Sugar.Errorf("[TRON-BLOCK] invalid block response for %d", num)
+			return
+		}
+		if err := processBlock(block, tokenMap); err != nil {
+			log.Sugar.Errorf("[TRON-BLOCK] process %d: %v", num, err)
+			return
+		}
+		if err := data.SavePaymentCursor("tron:blocks", strconv.FormatInt(num, 10)); err != nil {
+			log.Sugar.Errorf("[TRON-BLOCK] save cursor: %v", err)
+			return
+		}
 		s.lastBlock = num
 		s.totalBlocks++
 

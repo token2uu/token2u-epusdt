@@ -1,11 +1,7 @@
 name: sync-www
 
 on:
-  push:
-    branches:
-      - dev
-    paths-ignore:
-      - "src/www/**"
+  # Manual only: automatic sync would overwrite local cashier customizations.
   workflow_dispatch:
 
 permissions:

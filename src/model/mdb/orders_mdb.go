@@ -1,5 +1,7 @@
 package mdb
 
+import "time"
+
 const (
 	StatusWaitPay    = 1
 	StatusPaySuccess = 2
@@ -36,16 +38,25 @@ const (
 )
 
 type Orders struct {
-	TradeId            string  `gorm:"column:trade_id;uniqueIndex:orders_trade_id_uindex" json:"trade_id" example:"3nQ9pL2xV7sK1mR8cT4yB_aZ"`
-	OrderId            string  `gorm:"column:order_id;uniqueIndex:orders_order_id_uindex" json:"order_id" example:"ORD20260416001"`
-	ParentTradeId      string  `gorm:"column:parent_trade_id;index:idx_orders_parent_trade_id;default:''" json:"parent_trade_id"`
-	BlockTransactionId string  `gorm:"index:orders_block_transaction_id_index;column:block_transaction_id" json:"block_transaction_id" example:"0xabc123..."`
-	Amount             float64 `gorm:"column:amount" json:"amount" example:"100.0000"`
-	Currency           string  `gorm:"column:currency" json:"currency" example:"CNY"`
-	ActualAmount       float64 `gorm:"column:actual_amount" json:"actual_amount" example:"14.2857"`
-	ReceiveAddress     string  `gorm:"column:receive_address" json:"receive_address" example:"TTestTronAddress001"`
-	Token              string  `gorm:"column:token" json:"token" example:"USDT"`
-	Network            string  `gorm:"column:network" json:"network" example:"tron"`
+	CollectionMode     string     `gorm:"size:24;default:'';index;index:collection_history,priority:1" json:"collection_mode"`
+	PaymentExpiresAt   *time.Time `gorm:"index" json:"payment_expires_at,omitempty"`
+	AssignedAtMs       int64      `gorm:"default:0;index;index:collection_history,priority:5" json:"assigned_at_ms"`
+	ReleasedAtMs       int64      `gorm:"default:0" json:"released_at_ms"`
+	AssetID            string     `gorm:"size:256;default:''" json:"asset_id"`
+	AssetDecimals      int        `gorm:"default:0" json:"asset_decimals"`
+	MinimumPayment     string     `gorm:"size:80;default:''" json:"minimum_payment"`
+	FiatPerToken       string     `gorm:"size:120;default:''" json:"fiat_per_token"`
+	PaidCryptoAmount   string     `gorm:"size:120;default:''" json:"paid_crypto_amount"`
+	TradeId            string     `gorm:"column:trade_id;uniqueIndex:orders_trade_id_uindex" json:"trade_id" example:"3nQ9pL2xV7sK1mR8cT4yB_aZ"`
+	OrderId            string     `gorm:"column:order_id;uniqueIndex:orders_order_id_uindex" json:"order_id" example:"ORD20260416001"`
+	ParentTradeId      string     `gorm:"column:parent_trade_id;index:idx_orders_parent_trade_id;default:''" json:"parent_trade_id"`
+	BlockTransactionId string     `gorm:"index:orders_block_transaction_id_index;column:block_transaction_id" json:"block_transaction_id" example:"0xabc123..."`
+	Amount             float64    `gorm:"column:amount" json:"amount" example:"100.0000"`
+	Currency           string     `gorm:"column:currency" json:"currency" example:"CNY"`
+	ActualAmount       float64    `gorm:"column:actual_amount" json:"actual_amount" example:"14.2857"`
+	ReceiveAddress     string     `gorm:"column:receive_address;size:256;index:collection_history,priority:3" json:"receive_address" example:"TTestTronAddress001"`
+	Token              string     `gorm:"column:token;size:32;index:collection_history,priority:4" json:"token" example:"USDT"`
+	Network            string     `gorm:"column:network;size:32;index:collection_history,priority:2" json:"network" example:"tron"`
 	// 订单状态 1=等待支付 2=支付成功 3=已过期 4=等待选择支付网络/币种
 	Status      int    `gorm:"column:status;default:1" json:"status" enums:"1,2,3,4" example:"1"`
 	NotifyUrl   string `gorm:"column:notify_url" json:"notify_url" example:"https://example.com/notify"`

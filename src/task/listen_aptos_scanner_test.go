@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -44,10 +45,25 @@ func (f *fakeAptosProvider) Transactions(start int64, limit int64) ([]byte, erro
 	if err := f.errByStart[start]; err != nil {
 		return nil, err
 	}
-	if body := f.bodiesByStart[start]; len(body) > 0 {
+	if body, ok := f.bodiesByStart[start]; ok {
 		return append([]byte(nil), body...), nil
 	}
-	return []byte("[]"), nil
+	return aptosLedgerBatch(start, limit), nil
+}
+
+// A complete range may contain no payments, but still contains one committed
+// transaction per version, including metadata and state checkpoints.
+func aptosLedgerBatch(start, limit int64) []byte {
+	var body strings.Builder
+	body.WriteByte('[')
+	for i := int64(0); i < limit; i++ {
+		if i > 0 {
+			body.WriteByte(',')
+		}
+		fmt.Fprintf(&body, `{"type":"state_checkpoint_transaction","version":"%d"}`, start+i)
+	}
+	body.WriteByte(']')
+	return []byte(body.String())
 }
 
 func (f *fakeAptosProvider) rangeCalls() []aptosRangeCall {
@@ -120,7 +136,7 @@ func TestProcessAptosLedgerRangePassesConfiguredTokens(t *testing.T) {
 		sort.Strings(gotSymbols)
 		return nil, nil
 	}
-	provider := &fakeAptosProvider{bodiesByStart: map[int64][]byte{100: []byte("[]")}}
+	provider := &fakeAptosProvider{}
 
 	err = processAptosLedgerRange(context.Background(), provider, aptosLedgerRange{start: 100, limit: 1, state: state}, 100)
 	if err != nil {
@@ -223,7 +239,7 @@ func TestProcessAptosLedgerRoundAdvancesAfterSuccessfulRange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load state: %v", err)
 	}
-	provider := &fakeAptosProvider{bodiesByStart: map[int64][]byte{100: []byte("[]")}}
+	provider := &fakeAptosProvider{}
 	cursor := &aptosRuntimeCursor{initialized: true, lastSeenVersion: 99}
 
 	catchup, err := processAptosLedgerRound(context.Background(), provider, state, cursor, 250)
@@ -273,12 +289,7 @@ func TestProcessAptosLedgerRoundProcessesMultipleChunks(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load state: %v", err)
 	}
-	provider := &fakeAptosProvider{
-		bodiesByStart: map[int64][]byte{
-			100: []byte("[]"),
-			200: []byte("[]"),
-		},
-	}
+	provider := &fakeAptosProvider{}
 	cursor := &aptosRuntimeCursor{initialized: true, lastSeenVersion: 99}
 
 	catchup, err := processAptosLedgerRound(context.Background(), provider, state, cursor, 250)
@@ -385,7 +396,6 @@ func TestProcessAptosLedgerRoundDoesNotReprocessDuplicateTransferKey(t *testing.
 	provider := &fakeAptosProvider{
 		bodiesByStart: map[int64][]byte{
 			101: aptosFungibleTransferBody(t, "0xabc", 101, receive, usdc, "1200000"),
-			102: aptosFungibleTransferBody(t, "0xabc", 101, receive, usdc, "1200000"),
 		},
 	}
 	var processed int
@@ -398,14 +408,16 @@ func TestProcessAptosLedgerRoundDoesNotReprocessDuplicateTransferKey(t *testing.
 	if _, err = processAptosLedgerRound(context.Background(), provider, state, cursor, 101); err != nil {
 		t.Fatalf("first processAptosLedgerRound(): %v", err)
 	}
-	if _, err = processAptosLedgerRound(context.Background(), provider, state, cursor, 102); err != nil {
+	// Replay a real range instead of returning version 101 for a request for 102.
+	cursor.lastSeenVersion = 100
+	if _, err = processAptosLedgerRound(context.Background(), provider, state, cursor, 101); err != nil {
 		t.Fatalf("second processAptosLedgerRound(): %v", err)
 	}
 	if processed != 2 {
 		t.Fatalf("scanner processed callback count = %d, want 2", processed)
 	}
-	if cursor.lastSeenVersion != 102 {
-		t.Fatalf("lastSeenVersion = %d, want 102", cursor.lastSeenVersion)
+	if cursor.lastSeenVersion != 101 {
+		t.Fatalf("lastSeenVersion = %d, want 101", cursor.lastSeenVersion)
 	}
 }
 

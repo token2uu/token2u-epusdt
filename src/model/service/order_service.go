@@ -96,6 +96,10 @@ func validateCreateTransactionTokenNetwork(token, network string) error {
 }
 
 func buildCreateTransactionResponse(order *mdb.Orders) *response.CreateTransactionResponse {
+	expiry := carbon.Now().AddMinutes(config.GetOrderExpirationTime()).Timestamp()
+	if order.PaymentExpiresAt != nil {
+		expiry = order.PaymentExpiresAt.Unix()
+	}
 	return &response.CreateTransactionResponse{
 		TradeId:        order.TradeId,
 		OrderId:        order.OrderId,
@@ -105,7 +109,7 @@ func buildCreateTransactionResponse(order *mdb.Orders) *response.CreateTransacti
 		ReceiveAddress: order.ReceiveAddress,
 		Token:          order.Token,
 		Status:         order.Status,
-		ExpirationTime: carbon.Now().AddMinutes(config.GetOrderExpirationTime()).Timestamp(),
+		ExpirationTime: expiry,
 		PaymentUrl:     fmt.Sprintf("%s/pay/checkout-counter/%s", config.GetAppUri(), order.TradeId),
 	}
 }
@@ -165,6 +169,7 @@ func CreateTransaction(req *request.CreateTransactionRequest, apiKey *mdb.ApiKey
 			PayProvider: mdb.PaymentProviderOnChain,
 			ApiKeyID:    apiKeyID(apiKey),
 		}
+		setNewCollectionMode(order)
 		if err = data.CreateOrderWithTransaction(dao.Mdb, order); err != nil {
 			return nil, err
 		}
@@ -198,6 +203,21 @@ func CreateTransaction(req *request.CreateTransactionRequest, apiKey *mdb.ApiKey
 
 	tradeID := GenerateCode()
 	amount := math.MustParsePrecFloat64(decimalTokenAmount.InexactFloat64(), amountPrecision)
+	if paymentType == mdb.PaymentTypeEpay && config.EpayExclusiveAddresses() {
+		asset, assetErr := ensureEnabledOrderAsset(network, token)
+		if assetErr != nil {
+			return nil, assetErr
+		}
+		order := &mdb.Orders{TradeId: tradeID, OrderId: req.OrderId, Amount: payAmount, Currency: currency,
+			ActualAmount: amount, Token: token, Network: network, Status: mdb.StatusWaitPay, NotifyUrl: notifyURL,
+			RedirectUrl: req.RedirectUrl, Name: req.Name, EpayType: epayType, PaymentType: paymentType,
+			PayProvider: mdb.PaymentProviderOnChain, ApiKeyID: apiKeyID(apiKey)}
+		setNewCollectionMode(order)
+		if err := data.CreateExclusivePayment(order, *asset, walletAddress, false); err != nil {
+			return nil, err
+		}
+		return buildCreateTransactionResponse(order), nil
+	}
 	availableAddress, availableAmount, err := ReserveAvailableWalletAndAmount(tradeID, network, token, amount, walletAddress)
 	if err != nil {
 		return nil, err
@@ -257,6 +277,17 @@ func orderProcessingWithAllowedStatuses(req *request.OrderProcessingRequest, all
 func orderProcessing(req *request.OrderProcessingRequest, opts orderProcessingOptions) error {
 	gOrderProcessingLock.Lock()
 	defer gOrderProcessingLock.Unlock()
+
+	target, loadErr := data.GetOrderInfoByTradeId(req.TradeId)
+	if loadErr != nil {
+		return loadErr
+	}
+	if target.CollectionMode == mdb.CollectionExclusive {
+		if target.PayProvider == mdb.PaymentProviderOkPay {
+			return data.SettleExclusiveProvider(req.TradeId, req.BlockTransactionId)
+		}
+		return constant.ManualPaymentVerifyErr
+	}
 
 	tx := dao.Mdb.Begin()
 	exist, err := data.GetOrderByBlockIdWithTransaction(tx, req.BlockTransactionId)
@@ -406,7 +437,14 @@ func ReserveAvailableWalletAndAmount(tradeID string, network string, token strin
 	tryLockWalletFunc := func(targetAmount float64) (string, error) {
 		for _, address := range walletAddress {
 			normalizedAddress := normalizeOrderAddressByNetwork(network, address.Address)
-			err := data.LockTransaction(network, normalizedAddress, token, tradeID, targetAmount, config.GetOrderExpirationTimeDuration())
+			reserved, err := addressHasExclusiveHistory(network, normalizedAddress, token)
+			if err != nil {
+				return "", err
+			}
+			if reserved {
+				continue
+			}
+			err = data.LockTransaction(network, normalizedAddress, token, tradeID, targetAmount, config.GetOrderExpirationTimeDuration())
 			if err == nil {
 				return normalizedAddress, nil
 			}
@@ -493,6 +531,9 @@ func SubmitCashierManualPayment(tradeId, blockTransactionId string) (*response.M
 
 func submitManualPaymentForOrder(order *mdb.Orders, blockTransactionId string, allowedStatuses []int) (*response.ManualPaymentResponse, error) {
 	blockTransactionId = strings.TrimSpace(blockTransactionId)
+	if order.CollectionMode == mdb.CollectionExclusive {
+		return nil, constant.ManualPaymentVerifyErr
+	}
 	if err := validateManualPaymentOrderWithStatuses(order, allowedStatuses); err != nil {
 		return nil, err
 	}
@@ -598,6 +639,9 @@ func SwitchNetwork(req *request.SwitchNetworkRequest) (*response.CheckoutCounter
 		return nil, constant.OrderNotWaitPay
 	}
 
+	if parent.CollectionMode == mdb.CollectionExclusive && network != mdb.PaymentProviderOkPay {
+		return switchExclusiveNetwork(parent, token, network)
+	}
 	if network == mdb.PaymentProviderOkPay {
 		return switchToOkPay(parent, token)
 	}
@@ -774,6 +818,8 @@ func buildCheckoutResponse(order *mdb.Orders) *response.CheckoutCounterResponse 
 		paymentType = mdb.PaymentTypeEpay
 	}
 	return &response.CheckoutCounterResponse{
+		CollectionMode: order.CollectionMode, MinimumPayment: order.MinimumPayment,
+		PaidCryptoAmount: order.PaidCryptoAmount, PaidAmount: order.PaidAmount,
 		TradeId:        order.TradeId,
 		Amount:         order.Amount,
 		ActualAmount:   order.ActualAmount,
@@ -783,7 +829,7 @@ func buildCheckoutResponse(order *mdb.Orders) *response.CheckoutCounterResponse 
 		Network:        order.Network,
 		Status:         order.Status,
 		PaymentType:    strings.ToLower(paymentType),
-		ExpirationTime: order.CreatedAt.AddMinutes(config.GetOrderExpirationTime()).TimestampMilli(),
+		ExpirationTime: orderExpiryMillis(order),
 		RedirectUrl:    buildPublicRedirectURL(order),
 		CreatedAt:      order.CreatedAt.TimestampMilli(),
 		ServerTime:     carbon.Now().TimestampMilli(),
@@ -870,6 +916,20 @@ func completeWaitSelectOkPayOrder(parent *mdb.Orders, token string) (*response.C
 }
 
 func switchToOkPay(parent *mdb.Orders, token string) (*response.CheckoutCounterResponse, error) {
+	if parent.CollectionMode == mdb.CollectionExclusive {
+		if err := data.ExpireExclusivePayments(); err != nil {
+			return nil, err
+		}
+		fresh, err := data.GetOrderInfoByTradeId(parent.TradeId)
+		if err != nil {
+			return nil, err
+		}
+		parent = fresh
+		if parent.Status != mdb.StatusWaitPay && parent.Status != mdb.StatusWaitSelect {
+			return nil, constant.OrderNotWaitPay
+		}
+	}
+
 	if !data.GetOkPayEnabled() {
 		return nil, constant.PaymentProviderNotEnabled
 	}
@@ -959,25 +1019,27 @@ func switchToOkPay(parent *mdb.Orders, token string) (*response.CheckoutCounterR
 
 	tx := dao.Mdb.Begin()
 	subOrder := &mdb.Orders{
-		TradeId:         subTradeID,
-		OrderId:         subTradeID,
-		ParentTradeId:   parent.TradeId,
-		Amount:          parent.Amount,
-		Currency:        parent.Currency,
-		ActualAmount:    amount,
-		ReceiveAddress:  "OKPAY",
-		Token:           token,
-		Network:         mdb.NetworkTron,
-		Status:          mdb.StatusWaitPay,
-		IsSelected:      true,
-		NotifyUrl:       "",
-		RedirectUrl:     parent.RedirectUrl,
-		Name:            parent.Name,
-		EpayType:        parent.EpayType,
-		CallBackConfirm: mdb.CallBackConfirmOk,
-		PaymentType:     parent.PaymentType,
-		PayProvider:     mdb.PaymentProviderOkPay,
-		ApiKeyID:        parent.ApiKeyID,
+		TradeId:          subTradeID,
+		OrderId:          subTradeID,
+		ParentTradeId:    parent.TradeId,
+		Amount:           parent.Amount,
+		Currency:         parent.Currency,
+		ActualAmount:     amount,
+		ReceiveAddress:   "OKPAY",
+		Token:            token,
+		Network:          mdb.NetworkTron,
+		Status:           mdb.StatusWaitPay,
+		IsSelected:       true,
+		NotifyUrl:        "",
+		RedirectUrl:      parent.RedirectUrl,
+		Name:             parent.Name,
+		EpayType:         parent.EpayType,
+		CallBackConfirm:  mdb.CallBackConfirmOk,
+		PaymentType:      parent.PaymentType,
+		PayProvider:      mdb.PaymentProviderOkPay,
+		ApiKeyID:         parent.ApiKeyID,
+		CollectionMode:   parent.CollectionMode,
+		PaymentExpiresAt: parent.PaymentExpiresAt,
 	}
 	if err = data.CreateOrderWithTransaction(tx, subOrder); err != nil {
 		tx.Rollback()

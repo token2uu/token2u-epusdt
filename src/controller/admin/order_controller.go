@@ -115,6 +115,12 @@ func (c *BaseAdminController) CloseOrder(ctx echo.Context) error {
 	if order.Status != mdb.StatusWaitPay && order.Status != mdb.StatusWaitSelect {
 		return c.FailJson(ctx, constant.OrderNotWaitPay)
 	}
+	if order.CollectionMode == mdb.CollectionExclusive {
+		if err := data.CloseExclusivePayment(tradeID); err != nil {
+			return c.FailJson(ctx, err)
+		}
+		return c.SucJson(ctx, nil)
+	}
 	ok, err := data.CloseOrderManually(tradeID)
 	if err != nil {
 		return c.FailJson(ctx, err)

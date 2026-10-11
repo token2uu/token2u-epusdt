@@ -17,7 +17,12 @@ var gSolanaBlockHeightLock = make(chan struct{}, 1)
 func (r ListenSolJob) Run() {
 	shouldRecordHeight := false
 	func() {
-		gListenSolJobLock.Lock()
+		// A slow scan must not accumulate another waiting job every 5 seconds.
+		// The next admitted scan resumes from the persisted payment cursors.
+		if !gListenSolJobLock.TryLock() {
+			log.Sugar.Debug("[ListenSolJob] previous scan still running, skipping")
+			return
+		}
 		defer gListenSolJobLock.Unlock()
 
 		log.Sugar.Debug("[ListenSolJob] Job triggered")
@@ -38,10 +43,12 @@ func (r ListenSolJob) Run() {
 		}
 		log.Sugar.Infof("[ListenSolJob] Found %d wallet addresses to monitor", len(walletAddress))
 		var wg sync.WaitGroup
+		permits := make(chan struct{}, 8)
 		for _, address := range walletAddress {
 			log.Sugar.Infof("[ListenSolJob] Listening to address: %s", address.Address)
 			wg.Add(1)
-			go service.SolCallBack(address.Address, &wg)
+			permits <- struct{}{}
+			go func(addr string) { defer func() { <-permits }(); service.SolCallBack(addr, &wg) }(address.Address)
 		}
 		wg.Wait()
 		log.Sugar.Debug("[ListenSolJob] Job completed")

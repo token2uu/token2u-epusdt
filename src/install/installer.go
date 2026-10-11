@@ -481,6 +481,7 @@ queue_poll_interval_ms=1000
 callback_retry_base_seconds=5
 
 order_expiration_time={{.OrderExpirationTime}}
+epay_exclusive_addresses=true
 order_notice_max_retry={{.OrderNoticeMaxRetry}}
 
 api_rate_url=

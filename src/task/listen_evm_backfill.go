@@ -272,7 +272,9 @@ func processEvmBackfillLogs(ctx context.Context, client *ethclient.Client, netwo
 			headerCache[vLog.BlockNumber] = blockTsMs
 		}
 
-		service.TryProcessEvmERC20Transfer(network, vLog.Address, toAddr, new(big.Int).SetBytes(vLog.Data), vLog.TxHash.Hex(), blockTsMs)
+		if err := service.ProcessConfirmedEvmERC20Transfer(network, vLog.Address, toAddr, new(big.Int).SetBytes(vLog.Data), vLog.TxHash.Hex(), blockTsMs, vLog.Index); err != nil {
+			return err
+		}
 	}
 	return nil
 }

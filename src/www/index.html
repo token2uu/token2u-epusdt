@@ -53,6 +53,12 @@
 			root.style.colorScheme = resolved;
 		})();
 		</script>
+		<style id="cashier-branding-style">
+		/* Hide the complete cashier branding footer, including its spacing. */
+		footer:has(a[href="https://www.gmwallet.app"]) {
+			display: none;
+		}
+		</style>
 		<style id="splash-style">
 		@keyframes splash-bar {
 			0% {
@@ -218,5 +224,6 @@
 			>
 			<div id="splash-track"><span id="splash-bar"></span></div>
 		</div>
+	<script defer src="/admin/collection-tools.js"></script>
 	</body>
 </html>

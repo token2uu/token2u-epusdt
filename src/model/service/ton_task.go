@@ -118,6 +118,22 @@ func ParseTonInboundTransfer(tx *tlb.Transaction, receive *address.Address, nati
 }
 
 func TryProcessTonTransfer(transfer *TonObservedTransfer) {
+	if err := ProcessTonTransfer(transfer); err != nil {
+		log.Sugar.Errorf("[TON] collection: %v", err)
+	}
+}
+func ProcessTonTransfer(transfer *TonObservedTransfer) error {
+	if transfer == nil {
+		return nil
+	}
+	handled, err := processExclusivePayment(data.ObservedPayment{Network: mdb.NetworkTon, Address: transfer.ReceiveAddress, Token: transfer.Token.Symbol, AssetID: transfer.Token.ContractAddress, RawAmount: transfer.RawAmount, Decimals: transfer.Token.Decimals, TxHash: transfer.BlockID, EventID: fmt.Sprintf("inbound:%d", transfer.LT), BlockTimeMs: transfer.BlockTimeMs})
+	if err != nil || handled {
+		return err
+	}
+	processLegacyTonTransfer(transfer)
+	return nil
+}
+func processLegacyTonTransfer(transfer *TonObservedTransfer) {
 	if transfer == nil {
 		return
 	}

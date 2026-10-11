@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/GMWalletApp/epusdt/config"
+	"github.com/GMWalletApp/epusdt/model/dao"
 	"github.com/GMWalletApp/epusdt/model/data"
 	"github.com/GMWalletApp/epusdt/model/mdb"
 	"github.com/GMWalletApp/epusdt/model/request"
@@ -48,7 +49,7 @@ func ResolveTronNode() (string, string, error) {
 	return resolveTronNode()
 }
 
-func TryProcessTronTRC20Transfer(token mdb.ChainToken, toAddr string, rawValue *big.Int, txHash string, blockTsMs int64) {
+func processLegacyTronTRC20Transfer(token mdb.ChainToken, toAddr string, rawValue *big.Int, txHash string, blockTsMs int64) {
 	tokenSym := strings.ToUpper(strings.TrimSpace(token.Symbol))
 	defer func() {
 		if err := recover(); err != nil {
@@ -132,7 +133,7 @@ func TryProcessTronTRC20Transfer(token mdb.ChainToken, toAddr string, rawValue *
 	log.Sugar.Infof("[TRC20-%s][%s] payment processed trade_id=%s hash=%s", tokenSym, addr, tradeID, txHash)
 }
 
-func TryProcessTronTRXTransfer(toAddr string, rawSun int64, txHash string, blockTsMs int64) {
+func processLegacyTronTRXTransfer(toAddr string, rawSun int64, txHash string, blockTsMs int64) {
 	defer func() {
 		if err := recover(); err != nil {
 			log.Sugar.Errorf("[TRX][%s] TryProcessTronTRXTransfer panic: %v", toAddr, err)
@@ -214,7 +215,23 @@ func evmChainLogLabel(chainNetwork string) string {
 	}
 }
 
-func TryProcessEvmERC20Transfer(chainNetwork string, contract common.Address, toAddr common.Address, rawValue *big.Int, txHash string, blockTsMs int64) {
+func ProcessConfirmedEvmERC20Transfer(chainNetwork string, contract common.Address, toAddr common.Address, rawValue *big.Int, txHash string, blockTsMs int64, eventIndex uint) error {
+	tokenConfig, err := data.GetEnabledChainTokenByContract(chainNetwork, contract.Hex())
+	if err != nil {
+		return err
+	}
+	if tokenConfig == nil || tokenConfig.ID == 0 {
+		return nil
+	}
+	handled, err := processExclusivePayment(data.ObservedPayment{Network: chainNetwork, Address: toAddr.Hex(), Token: tokenConfig.Symbol, AssetID: contract.Hex(), RawAmount: rawValue, Decimals: tokenConfig.Decimals, TxHash: txHash, EventID: fmt.Sprintf("log:%d", eventIndex), BlockTimeMs: blockTsMs})
+	if err != nil || handled {
+		return err
+	}
+	TryProcessEvmERC20Transfer(chainNetwork, contract, toAddr, rawValue, txHash, blockTsMs, eventIndex)
+	return nil
+}
+
+func TryProcessEvmERC20Transfer(chainNetwork string, contract common.Address, toAddr common.Address, rawValue *big.Int, txHash string, blockTsMs int64, eventIndex ...uint) {
 	defer func() {
 		if err := recover(); err != nil {
 			log.Sugar.Errorf("[%s-WS] TryProcessEvmERC20Transfer panic: %v", evmChainLogLabel(chainNetwork), err)
@@ -229,6 +246,16 @@ func TryProcessEvmERC20Transfer(chainNetwork string, contract common.Address, to
 	}
 	if tokenConfig == nil || tokenConfig.ID == 0 {
 		log.Sugar.Warnf("[%s-WS] skip unconfigured contract %s", net, contract.Hex())
+		return
+	}
+	// Websocket events may not yet be confirmed. Exclusive assignments are
+	// settled by the durable confirmed-block scanner instead.
+	var exclusive int64
+	if err := dao.Mdb.Model(&mdb.PaymentAddress{}).Where("network = ? AND address = ? AND asset_id = ?", chainNetwork, strings.ToLower(toAddr.Hex()), data.PaymentAssetID(chainNetwork, contract.Hex())).Count(&exclusive).Error; err != nil {
+		log.Sugar.Errorf("[EVM] collection lookup: %v", err)
+		return
+	}
+	if exclusive > 0 {
 		return
 	}
 	tokenSym := strings.ToUpper(strings.TrimSpace(tokenConfig.Symbol))
@@ -375,6 +402,12 @@ func sendPaymentNotification(order *mdb.Orders) {
 		}
 	}
 
+	actualReceived := order.ActualAmount
+	if order.CollectionMode == mdb.CollectionExclusive {
+		if amount, err := decimal.NewFromString(order.PaidCryptoAmount); err == nil {
+			actualReceived = amount.InexactFloat64()
+		}
+	}
 	precision := data.GetAmountPrecision()
 	amountFormat := fmt.Sprintf("%%.%df", precision)
 	msg := fmt.Sprintf(
@@ -392,7 +425,7 @@ func sendPaymentNotification(order *mdb.Orders) {
 			"└ 支付时间：%s",
 		order.Amount,
 		strings.ToUpper(order.Currency),
-		order.ActualAmount,
+		actualReceived,
 		strings.ToUpper(order.Token),
 		order.TradeId,
 		order.OrderId,
@@ -423,5 +456,36 @@ func networkDisplay(n string) string {
 			return "Tron"
 		}
 		return strings.ToUpper(n)
+	}
+}
+
+// Result variants let block scanners retain their cursor on database failures.
+func ProcessTronTRC20Transfer(token mdb.ChainToken, to string, raw *big.Int, hash string, ts int64) error {
+	handled, err := processExclusivePayment(data.ObservedPayment{Network: mdb.NetworkTron, Address: to,
+		Token: token.Symbol, AssetID: token.ContractAddress, RawAmount: raw, Decimals: token.Decimals,
+		TxHash: hash, EventID: "contract:0", BlockTimeMs: ts})
+	if err != nil || handled {
+		return err
+	}
+	processLegacyTronTRC20Transfer(token, to, raw, hash, ts)
+	return nil
+}
+func TryProcessTronTRC20Transfer(token mdb.ChainToken, to string, raw *big.Int, hash string, ts int64) {
+	if err := ProcessTronTRC20Transfer(token, to, raw, hash, ts); err != nil {
+		log.Sugar.Errorf("[TRON] collection: %v", err)
+	}
+}
+func ProcessTronTRXTransfer(to string, raw int64, hash string, ts int64) error {
+	handled, err := processExclusivePayment(data.ObservedPayment{Network: mdb.NetworkTron, Address: to,
+		Token: "TRX", AssetID: "", RawAmount: big.NewInt(raw), Decimals: 6, TxHash: hash, EventID: "contract:0", BlockTimeMs: ts})
+	if err != nil || handled {
+		return err
+	}
+	processLegacyTronTRXTransfer(to, raw, hash, ts)
+	return nil
+}
+func TryProcessTronTRXTransfer(to string, raw int64, hash string, ts int64) {
+	if err := ProcessTronTRXTransfer(to, raw, hash, ts); err != nil {
+		log.Sugar.Errorf("[TRON] collection: %v", err)
 	}
 }

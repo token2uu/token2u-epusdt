@@ -40,6 +40,7 @@ func setupTestEnv(t *testing.T) *echo.Echo {
 
 	// minimal viper config
 	viper.Reset()
+	viper.Set("epay_exclusive_addresses", false)
 	viper.Set("db_type", "sqlite")
 	viper.Set("app_uri", "http://localhost:8080")
 	viper.Set("order_expiration_time", 10)
@@ -71,6 +72,7 @@ func setupTestEnv(t *testing.T) *echo.Echo {
 	// ensure tables exist (MdbTableInit uses sync.Once, so migrate directly)
 	dao.Mdb.AutoMigrate(
 		&mdb.Orders{},
+		&mdb.PaymentAddress{}, &mdb.PaymentReceipt{}, &mdb.PaymentScanCursor{},
 		&mdb.WalletAddress{},
 		&mdb.AdminUser{},
 		&mdb.ApiKey{},

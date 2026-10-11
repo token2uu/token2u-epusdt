@@ -380,6 +380,12 @@ func GetQueueConcurrency() int {
 	return concurrency
 }
 
+// Existing orders retain their persisted mode. This flag affects only newly
+// created EPay orders; unset enables the new single-instance collection mode.
+func EpayExclusiveAddresses() bool {
+	return !viper.IsSet("epay_exclusive_addresses") || viper.GetBool("epay_exclusive_addresses")
+}
+
 func GetQueuePollInterval() time.Duration {
 	interval := viper.GetInt("queue_poll_interval_ms")
 	if interval <= 0 {

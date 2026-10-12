@@ -18,6 +18,7 @@ import (
 )
 
 func TestListenSolJobSkipsOverlapAndCatchesUpNextRun(t *testing.T) {
+	resetSolanaSchedule(t)
 	t.Cleanup(testutil.SetupTestDatabases(t))
 	data.ResetRpcRuntimeStatsForTest()
 	t.Cleanup(data.ResetRpcRuntimeStatsForTest)
@@ -51,20 +52,20 @@ func TestListenSolJobSkipsOverlapAndCatchesUpNextRun(t *testing.T) {
 					return
 				}
 			}
-			var opts struct{ Until string }
+			var opts struct{ Until, Before string }
 			if len(req.Params) != 2 || json.Unmarshal(req.Params[1], &opts) != nil {
 				http.Error(w, "invalid signature query", http.StatusBadRequest)
 				return
 			}
 			rows := []map[string]interface{}{}
-			if available && opts.Until != signature {
+			if available && opts.Until != signature && opts.Before != signature {
 				rows = append(rows, map[string]interface{}{"signature": signature, "slot": 2, "err": nil, "blockTime": blockTime})
 			}
 			result = rows
 		case "getTransaction":
 			result = map[string]interface{}{
 				"blockTime": blockTime, "meta": map[string]interface{}{"err": nil},
-				"transaction": map[string]interface{}{"message": map[string]interface{}{"instructions": []interface{}{
+				"transaction": map[string]interface{}{"signatures": []string{signature}, "message": map[string]interface{}{"instructions": []interface{}{
 					map[string]interface{}{"programId": service.SystemProgramID, "parsed": map[string]interface{}{
 						"type": "transfer", "info": map[string]interface{}{"source": "sender", "destination": owner, "lamports": 3_000_000_000},
 					}},

@@ -22,6 +22,8 @@ func SetupTestDatabases(t testing.TB) func() {
 	t.Helper()
 
 	viper.Reset()
+	viper.Set("rpc_public_requests_per_second", 1000)
+	viper.Set("rpc_paid_requests_per_second", 1000)
 	// Existing fixtures exercise the legacy amount-lock protocol.
 	viper.Set("epay_exclusive_addresses", false)
 	viper.Set("app_uri", "https://example.com")

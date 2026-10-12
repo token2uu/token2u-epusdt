@@ -56,16 +56,17 @@ type RpcStatsSummaryResponse struct {
 
 // RpcStatsChainResponse is one chain's in-process RPC runtime stats.
 type RpcStatsChainResponse struct {
-	Network           string  `json:"network" example:"tron"`
-	DisplayName       string  `json:"display_name" example:"TRON"`
-	Enabled           bool    `json:"enabled" example:"true"`
-	HasData           bool    `json:"has_data" example:"true"`
-	Status            string  `json:"status" example:"ok" enums:"ok,warning,down,unknown,disabled"`
-	SuccessCount      int64   `json:"success_count" example:"123"`
-	FailureCount      int64   `json:"failure_count" example:"2"`
-	SuccessRate       float64 `json:"success_rate" example:"0.984"`
-	LatestBlockHeight int64   `json:"latest_block_height" example:"64532100"`
-	LastSyncAt        string  `json:"last_sync_at" example:"2026-06-09T12:00:00+08:00"`
+	Routing           data.RpcRoutingStats `json:"routing"`
+	Network           string               `json:"network" example:"tron"`
+	DisplayName       string               `json:"display_name" example:"TRON"`
+	Enabled           bool                 `json:"enabled" example:"true"`
+	HasData           bool                 `json:"has_data" example:"true"`
+	Status            string               `json:"status" example:"ok" enums:"ok,warning,down,unknown,disabled"`
+	SuccessCount      int64                `json:"success_count" example:"123"`
+	FailureCount      int64                `json:"failure_count" example:"2"`
+	SuccessRate       float64              `json:"success_rate" example:"0.984"`
+	LatestBlockHeight int64                `json:"latest_block_height" example:"64532100"`
+	LastSyncAt        string               `json:"last_sync_at" example:"2026-06-09T12:00:00+08:00"`
 }
 
 type rpcStatsStreamEnvelope struct {
@@ -296,6 +297,7 @@ func buildRpcStatsResponse() (RpcStatsDashboardResponse, error) {
 		return RpcStatsDashboardResponse{}, err
 	}
 	stats := data.SnapshotRpcRuntimeStats()
+	routing := data.SnapshotRpcRoutingStats()
 	now := time.Now()
 	resp := RpcStatsDashboardResponse{
 		GeneratedAt: now.Format(time.RFC3339),
@@ -335,6 +337,7 @@ func buildRpcStatsResponse() (RpcStatsDashboardResponse, error) {
 		resp.Summary.FailureCount += stat.FailureCount
 
 		resp.Chains = append(resp.Chains, RpcStatsChainResponse{
+			Routing:           routing[network],
 			Network:           chain.Network,
 			DisplayName:       rpcStatsDisplayName(chain.Network, chain.DisplayName),
 			Enabled:           chain.Enabled,

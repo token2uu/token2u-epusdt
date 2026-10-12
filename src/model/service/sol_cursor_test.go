@@ -26,6 +26,8 @@ type solCursorLedger struct {
 	transactions   map[string]interface{}
 	failPagination bool
 	rateLimited    bool
+	pageLimit      int
+	repeatPage     bool
 }
 
 func (l *solCursorLedger) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -64,6 +66,12 @@ func (l *solCursorLedger) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if l.failPagination && opts.Before != "" {
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{"error": map[string]interface{}{"code": -32000, "message": "temporary page failure"}})
 			return
+		}
+		if l.pageLimit > 0 && opts.Limit > l.pageLimit {
+			opts.Limit = l.pageLimit
+		}
+		if l.repeatPage {
+			opts.Before = ""
 		}
 		batch := make([]solSignatureResult, 0)
 		if target == l.ata {
@@ -122,7 +130,7 @@ func (l *solCursorLedger) add(sig string, slot uint64, amount string) {
 	} else {
 		l.transactions[sig] = map[string]interface{}{
 			"blockTime": now, "meta": map[string]interface{}{"err": nil},
-			"transaction": map[string]interface{}{"message": map[string]interface{}{"instructions": []interface{}{
+			"transaction": map[string]interface{}{"signatures": []string{sig}, "message": map[string]interface{}{"instructions": []interface{}{
 				map[string]interface{}{"programId": TokenProgramID, "parsed": map[string]interface{}{
 					"type": "transferChecked", "info": map[string]interface{}{
 						"source": "source-ata", "destination": l.ata, "mint": USDT_Mint,
@@ -230,6 +238,9 @@ func TestSolCursorPaginationRetriesBeforeAdvancing(t *testing.T) {
 	l.mu.Lock()
 	l.failPagination = false
 	l.mu.Unlock()
+	// The failed endpoint now has a short shared cooldown. Simulate expiry;
+	// the durable scan must still resume at A and include the second page.
+	data.ResetRpcEndpointPolicyForTest()
 	clearProcessedSignatures()
 	scanSolCursor()
 	assertSolCursor(t, l, "new-0999")
@@ -373,6 +384,8 @@ func TestSolCursorIncompleteDetailRetries(t *testing.T) {
 				}
 			}
 			l.transactions["B"] = full
+			data.ResetRpcEndpointPolicyForTest()
+			data.ResetRpcFailoverForTest()
 			clearProcessedSignatures() // Simulate restart using only persisted progress.
 			scanSolCursor()
 			assertSolCursor(t, l, "C")
@@ -403,7 +416,7 @@ func TestSolCursorValidOptionalMetadataAndCPI(t *testing.T) {
 			}
 			// A successful non-payment transaction must not stall scanning.
 			l.add("C", 3, "1")
-			l.transactions["C"] = map[string]interface{}{"meta": map[string]interface{}{"err": nil}, "transaction": map[string]interface{}{"message": map[string]interface{}{"instructions": []interface{}{
+			l.transactions["C"] = map[string]interface{}{"meta": map[string]interface{}{"err": nil}, "transaction": map[string]interface{}{"signatures": []string{"C"}, "message": map[string]interface{}{"instructions": []interface{}{
 				map[string]interface{}{"programId": "memo-program", "parsed": "a memo"},
 			}}}}
 			scanSolCursor()
@@ -444,6 +457,8 @@ func TestSolCursorFirstScanFailureKeepsInitialLookback(t *testing.T) {
 	// has passed, without sleeping. The persisted starting boundary must win.
 	viper.Set("order_expiration_time", 10)
 	l.transactions["B"] = full
+	data.ResetRpcEndpointPolicyForTest()
+	data.ResetRpcFailoverForTest()
 	clearProcessedSignatures()
 	scanSolCursor()
 	assertSolCursor(t, l, "B")

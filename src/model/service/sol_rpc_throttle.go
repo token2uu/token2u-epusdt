@@ -1,20 +1,23 @@
 package service
 
 import (
-	"context"
+	"crypto/sha256"
 	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/GMWalletApp/epusdt/config"
 )
 
 // All Solana HTTP calls (including retries and probes) share one request budget.
 // Endpoint cooldowns are separate so a limited primary does not block a backup.
 var solRPCThrottle = &solanaRPCThrottle{cooldowns: make(map[string]time.Time)}
+
+func solThrottleIdentity(endpoint, credential string) string {
+	identity := sha256.Sum256([]byte(endpoint + "\x00" + credential))
+	return string(identity[:])
+}
 
 type solanaRPCThrottle struct {
 	mu        sync.Mutex
@@ -26,36 +29,6 @@ type solanaRateLimitError struct{ until time.Time }
 
 func (e *solanaRateLimitError) Error() string {
 	return fmt.Sprintf("solana rpc HTTP 429 (cooldown until %s)", e.until.UTC().Format(time.RFC3339))
-}
-
-func (g *solanaRPCThrottle) wait(ctx context.Context, endpoint string) error {
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		g.mu.Lock()
-		now := time.Now()
-		if until := g.cooldowns[endpoint]; now.Before(until) {
-			g.mu.Unlock()
-			return &solanaRateLimitError{until: until}
-		}
-		delete(g.cooldowns, endpoint)
-		delay := g.next.Sub(now)
-		if delay <= 0 {
-			g.next = now.Add(config.GetSolanaRPCInterval())
-			g.mu.Unlock()
-			return nil
-		}
-		g.mu.Unlock()
-		timer := time.NewTimer(delay)
-		select {
-		case <-ctx.Done():
-			timer.Stop()
-			return ctx.Err()
-		case <-timer.C:
-		}
-		// Recheck after sleeping: another request may have received a 429.
-	}
 }
 
 func (g *solanaRPCThrottle) rateLimited(endpoint, retryAfter string) *solanaRateLimitError {

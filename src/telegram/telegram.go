@@ -22,6 +22,7 @@ var (
 	bots        *tb.Bot
 	adminChatID int64
 	reloadMu    sync.Mutex
+	reloadJobs  sync.WaitGroup
 )
 
 // BotStart connects the command bot. If no telegram channel is
@@ -38,12 +39,18 @@ func BotStart() {
 // It is used by admin API handlers after telegram channel create/update/
 // status/delete so operators don't need to restart the service.
 func ReloadBotAsync(reason string) {
+	reloadJobs.Add(1)
 	go func() {
+		defer reloadJobs.Done()
 		if err := reloadBot(reason); err != nil {
 			log.Sugar.Errorf("[telegram] reload failed, reason=%s err=%v", reason, err)
 		}
 	}()
 }
+
+// WaitForReloads drains jobs already scheduled by admin handlers. Call after
+// stopping requests, before replacing shared dependencies or shutting down.
+func WaitForReloads() { reloadJobs.Wait() }
 
 // loadCommandBotConfig reads the command-bot config from the settings
 // table (system.telegram_bot_token + system.telegram_chat_id).

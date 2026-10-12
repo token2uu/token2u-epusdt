@@ -398,6 +398,22 @@ func GetSolanaScanConcurrency() int {
 	return concurrency
 }
 
+func GetSolanaIdleScanInterval() time.Duration {
+	seconds := viper.GetInt("solana_idle_scan_interval_seconds")
+	if seconds <= 0 {
+		seconds = 300
+	}
+	return max(time.Duration(seconds)*time.Second, GetSolanaScanInterval())
+}
+
+func GetSolanaRecentActivityWindow() time.Duration {
+	seconds := viper.GetInt("solana_recent_activity_seconds")
+	if seconds <= 0 {
+		seconds = 600
+	}
+	return time.Duration(seconds) * time.Second
+}
+
 func GetSolanaRPCInterval() time.Duration {
 	rps := viper.GetFloat64("solana_rpc_requests_per_second")
 	if rps <= 0 || math.IsNaN(rps) || math.IsInf(rps, 0) {

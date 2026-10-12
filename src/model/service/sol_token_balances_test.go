@@ -102,6 +102,8 @@ func TestSolCursorUncheckedBalancesRetryAfterRepair(t *testing.T) {
 				meta[balanceField] = []interface{}{map[string]interface{}{"accountIndex": 1, "mint": USDT_Mint, "uiTokenAmount": map[string]interface{}{"amount": "3000000", "decimals": 6}}}
 				message["accountKeys"] = keys
 				clearProcessedSignatures()
+				data.ResetRpcEndpointPolicyForTest()
+				data.ResetRpcFailoverForTest()
 				scanSolCursor()
 				assertSolCursor(t, l, "B")
 				assertSolCursorSettlement(t, o)
@@ -148,6 +150,8 @@ func TestSolCursorClosedTokenAccountsDoNotBlockPayment(t *testing.T) {
 				t.Fatal(err)
 			}
 			clearProcessedSignatures()
+			data.ResetRpcEndpointPolicyForTest()
+			data.ResetRpcFailoverForTest()
 			scanSolCursor()
 			assertSolCursorSettlement(t, o)
 		})
@@ -157,6 +161,11 @@ func TestSolCursorClosedTokenAccountsDoNotBlockPayment(t *testing.T) {
 func TestSolCursorUncheckedZeroDecimals(t *testing.T) {
 	l := setupSolCursorLedger(t)
 	o := solCursorOrder(t)
+	// This fixture represents a zero-decimal token: both its configured
+	// precision and the order snapshot must agree with the RPC evidence.
+	if err := dao.Mdb.Model(&mdb.ChainToken{}).Where("network = ? AND contract_address = ?", mdb.NetworkSolana, USDT_Mint).Update("decimals", 0).Error; err != nil {
+		t.Fatal(err)
+	}
 	if err := dao.Mdb.Model(o).Update("asset_decimals", 0).Error; err != nil {
 		t.Fatal(err)
 	}

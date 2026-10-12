@@ -32,8 +32,8 @@ func NormalizeRpcNodePurpose(purpose string) string {
 	switch strings.ToLower(strings.TrimSpace(purpose)) {
 	case mdb.RpcNodePurposeManualVerify:
 		return mdb.RpcNodePurposeManualVerify
-	case mdb.RpcNodePurposeBoth:
-		return mdb.RpcNodePurposeBoth
+	case mdb.RpcNodePurposeBoth, mdb.RpcNodePurposePaidFallback:
+		return strings.ToLower(strings.TrimSpace(purpose))
 	default:
 		return mdb.RpcNodePurposeGeneral
 	}
@@ -56,36 +56,39 @@ func ListRpcNodes(network string) ([]mdb.RpcNode, error) {
 func ListRpcNodesForHealth() ([]mdb.RpcNode, error) {
 	var rows []mdb.RpcNode
 	err := dao.Mdb.Model(&mdb.RpcNode{}).
-		Where("(purpose IN ? OR purpose = '' OR purpose IS NULL)", []string{mdb.RpcNodePurposeGeneral, mdb.RpcNodePurposeBoth}).
+		Where("(purpose IN ? OR purpose = '' OR purpose IS NULL)", []string{mdb.RpcNodePurposeGeneral, mdb.RpcNodePurposeBoth, mdb.RpcNodePurposePaidFallback}).
 		Order("id ASC").
 		Find(&rows).Error
 	return rows, err
 }
 
 // ListGeneralRpcCandidates returns enabled non-manual nodes for ordinary
-// scanners/listeners. Down nodes are skipped; ok nodes are ordered before
-// unknown/bootstrap nodes.
+// scanners/listeners. Public nodes precede paid fallback nodes. Down public
+// nodes are skipped; paid nodes remain eligible for on-demand recovery probes.
 func ListGeneralRpcCandidates(network, nodeType string) ([]mdb.RpcNode, error) {
 	var rows []mdb.RpcNode
 	err := dao.Mdb.Model(&mdb.RpcNode{}).
 		Where("network = ?", strings.ToLower(strings.TrimSpace(network))).
 		Where("type = ?", strings.ToLower(strings.TrimSpace(nodeType))).
 		Where("enabled = ?", true).
-		Where("(purpose IN ? OR purpose = '' OR purpose IS NULL)", []string{mdb.RpcNodePurposeGeneral, mdb.RpcNodePurposeBoth}).
-		Where("(status IN ? OR status = '' OR status IS NULL)", []string{mdb.RpcNodeStatusOk, mdb.RpcNodeStatusUnknown}).
+		Where("(purpose IN ? OR purpose = '' OR purpose IS NULL)", []string{mdb.RpcNodePurposeGeneral, mdb.RpcNodePurposeBoth, mdb.RpcNodePurposePaidFallback}).
+		Where("(status IN ? OR status = '' OR status IS NULL OR purpose = ?)", []string{mdb.RpcNodeStatusOk, mdb.RpcNodeStatusUnknown}, mdb.RpcNodePurposePaidFallback).
 		Find(&rows).Error
 	if err != nil {
 		return nil, err
 	}
 
-	buckets := make([][]mdb.RpcNode, 2)
+	buckets := make([][]mdb.RpcNode, 4)
 	for _, row := range rows {
 		row.Purpose = NormalizeRpcNodePurpose(row.Purpose)
-		if row.Status == mdb.RpcNodeStatusOk {
-			buckets[0] = append(buckets[0], row)
-		} else {
-			buckets[1] = append(buckets[1], row)
+		bucket := 0
+		if row.Purpose == mdb.RpcNodePurposePaidFallback {
+			bucket = 2
 		}
+		if row.Status != mdb.RpcNodeStatusOk {
+			bucket++
+		}
+		buckets[bucket] = append(buckets[bucket], row)
 	}
 
 	out := make([]mdb.RpcNode, 0, len(rows))
@@ -111,19 +114,26 @@ func SelectGeneralRpcNode(network, nodeType string, excludeIDs ...uint64) (*mdb.
 			excluded[id] = struct{}{}
 		}
 	}
+	// Reserve the third attempt for a paid fallback even if more public nodes
+	// exist. Weight only orders nodes within their cost/health group.
+	if len(excluded) >= 2 {
+		for i := range rows {
+			if rows[i].Purpose != mdb.RpcNodePurposePaidFallback || RpcEndpointCoolingDown(rows[i]) {
+				continue
+			}
+			if _, ok := excluded[rows[i].ID]; !ok {
+				return &rows[i], nil
+			}
+		}
+	}
 	for i := range rows {
 		if _, ok := excluded[rows[i].ID]; ok {
 			continue
 		}
-		if IsRpcNodeCoolingDown(rows[i].ID) {
+		if RpcEndpointCoolingDown(rows[i]) {
 			continue
 		}
 		return &rows[i], nil
-	}
-	if len(excluded) == 0 {
-		for i := range rows {
-			return &rows[i], nil
-		}
 	}
 	return nil, nil
 }
@@ -157,38 +167,22 @@ func DeleteRpcNodeByID(id uint64) error {
 	return dao.Mdb.Where("id = ?", id).Delete(&mdb.RpcNode{}).Error
 }
 
-// SelectRpcNode picks a healthy RPC endpoint for a (network, type) pair.
-// Strategy: weighted random among rows where enabled=true AND status=ok.
-// Falls back to enabled rows with status=unknown when no health check has
-// run yet. Explicitly down rows are not selected. Manual verification nodes
-// are excluded so paid/manual-only RPCs are never used by scanners/listeners.
+// SelectRpcNode uses weighted selection within the first eligible cost/health
+// group. Public nodes precede paid fallback nodes; manual-only nodes are excluded.
 func SelectRpcNode(network, nodeType string) (*mdb.RpcNode, error) {
-	var rows []mdb.RpcNode
-	err := dao.Mdb.Model(&mdb.RpcNode{}).
-		Where("network = ?", strings.ToLower(network)).
-		Where("type = ?", strings.ToLower(nodeType)).
-		Where("enabled = ?", true).
-		Where("(purpose IN ? OR purpose = '' OR purpose IS NULL)", []string{mdb.RpcNodePurposeGeneral, mdb.RpcNodePurposeBoth}).
-		Find(&rows).Error
+	rows, err := ListGeneralRpcCandidates(network, nodeType)
 	if err != nil {
 		return nil, err
 	}
-	if len(rows) == 0 {
-		return nil, nil
-	}
-	healthy := make([]mdb.RpcNode, 0, len(rows))
-	bootstrap := make([]mdb.RpcNode, 0, len(rows))
-	for _, r := range rows {
-		switch r.Status {
-		case mdb.RpcNodeStatusOk:
-			healthy = append(healthy, r)
-		case "", mdb.RpcNodeStatusUnknown:
-			bootstrap = append(bootstrap, r)
+	var candidates []mdb.RpcNode
+	for _, row := range rows {
+		if RpcEndpointCoolingDown(row) {
+			continue
 		}
-	}
-	candidates := healthy
-	if len(candidates) == 0 {
-		candidates = bootstrap
+		if len(candidates) > 0 && ((row.Purpose == mdb.RpcNodePurposePaidFallback) != (candidates[0].Purpose == mdb.RpcNodePurposePaidFallback) || row.Status != candidates[0].Status) {
+			break
+		}
+		candidates = append(candidates, row)
 	}
 	if len(candidates) == 0 {
 		return nil, nil
@@ -214,7 +208,7 @@ func ListManualPaymentRpcCandidates(network, nodeType string) ([]mdb.RpcNode, er
 		return nil, nil
 	}
 
-	buckets := make([][]mdb.RpcNode, 4)
+	buckets := make([][]mdb.RpcNode, 6)
 	for _, row := range rows {
 		row.Purpose = NormalizeRpcNodePurpose(row.Purpose)
 		switch row.Purpose {
@@ -224,11 +218,17 @@ func ListManualPaymentRpcCandidates(network, nodeType string) ([]mdb.RpcNode, er
 			} else {
 				buckets[1] = append(buckets[1], row)
 			}
-		case mdb.RpcNodePurposeManualVerify:
+		case mdb.RpcNodePurposePaidFallback:
 			if row.Status == mdb.RpcNodeStatusOk {
 				buckets[2] = append(buckets[2], row)
 			} else {
 				buckets[3] = append(buckets[3], row)
+			}
+		case mdb.RpcNodePurposeManualVerify:
+			if row.Status == mdb.RpcNodeStatusOk {
+				buckets[4] = append(buckets[4], row)
+			} else {
+				buckets[5] = append(buckets[5], row)
 			}
 		}
 	}

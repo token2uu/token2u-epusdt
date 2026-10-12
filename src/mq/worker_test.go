@@ -162,6 +162,7 @@ func TestDispatchPendingCallbacksHonorsBackoffAndPersistsSuccess(t *testing.T) {
 
 	callbackLimiter = make(chan struct{}, 1)
 	callbackInflight = sync.Map{}
+	defer waitForCallbackWorkers(t)
 
 	var requestCount int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -219,6 +220,7 @@ func TestDispatchPendingCallbacksResumesRetryAfterRestart(t *testing.T) {
 
 	callbackLimiter = make(chan struct{}, 1)
 	callbackInflight = sync.Map{}
+	defer waitForCallbackWorkers(t)
 
 	var requestCount int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -264,6 +266,8 @@ func TestDispatchPendingCallbacksResumesRetryAfterRestart(t *testing.T) {
 		t.Fatalf("first callback request count = %d, want 1", got)
 	}
 
+	// A real restart terminates old workers before replacing process state.
+	waitForCallbackWorkers(t)
 	callbackLimiter = make(chan struct{}, 1)
 	callbackInflight = sync.Map{}
 
@@ -292,6 +296,7 @@ func TestDispatchPendingCallbacksEpayRequiresAck(t *testing.T) {
 
 	callbackLimiter = make(chan struct{}, 1)
 	callbackInflight = sync.Map{}
+	defer waitForCallbackWorkers(t)
 
 	epayKey, err := data.GetEnabledApiKey("1001")
 	if err != nil || epayKey == nil || epayKey.ID == 0 {
@@ -346,6 +351,7 @@ func TestDispatchPendingCallbacksEpayAcceptsTrimmedOk(t *testing.T) {
 
 	callbackLimiter = make(chan struct{}, 1)
 	callbackInflight = sync.Map{}
+	defer waitForCallbackWorkers(t)
 
 	epayKey, err := data.GetEnabledApiKey("1001")
 	if err != nil || epayKey == nil || epayKey.ID == 0 {
@@ -714,6 +720,7 @@ func TestDispatchPendingCallbacksEpayAcceptsSuccessAck(t *testing.T) {
 
 	callbackLimiter = make(chan struct{}, 1)
 	callbackInflight = sync.Map{}
+	defer waitForCallbackWorkers(t)
 
 	epayKey, err := data.GetEnabledApiKey("1001")
 	if err != nil || epayKey == nil || epayKey.ID == 0 {
@@ -887,6 +894,7 @@ func TestExpiredOrderCallbackEndToEnd(t *testing.T) {
 
 	callbackLimiter = make(chan struct{}, 1)
 	callbackInflight = sync.Map{}
+	defer waitForCallbackWorkers(t)
 
 	var requestCount int32
 	var receivedTradeStatus string
@@ -905,18 +913,18 @@ func TestExpiredOrderCallbackEndToEnd(t *testing.T) {
 	}
 
 	order := &mdb.Orders{
-		TradeId:     "trade_e2e_expired",
-		OrderId:     "order_e2e_expired",
-		Amount:      1,
-		Currency:    "CNY",
-		ActualAmount: 1,
+		TradeId:        "trade_e2e_expired",
+		OrderId:        "order_e2e_expired",
+		Amount:         1,
+		Currency:       "CNY",
+		ActualAmount:   1,
 		ReceiveAddress: "wallet_e2e_expired",
-		Token:       "USDT",
-		Network:     "tron",
-		Status:      mdb.StatusWaitPay,
-		NotifyUrl:   server.URL,
-		PaymentType: mdb.PaymentTypeEpay,
-		ApiKeyID:    epayKey.ID,
+		Token:          "USDT",
+		Network:        "tron",
+		Status:         mdb.StatusWaitPay,
+		NotifyUrl:      server.URL,
+		PaymentType:    mdb.PaymentTypeEpay,
+		ApiKeyID:       epayKey.ID,
 	}
 	if err := dao.Mdb.Create(order).Error; err != nil {
 		t.Fatalf("create order: %v", err)
@@ -962,6 +970,7 @@ func TestPlaceholderExpiredOrderDoesNotTriggerCallback(t *testing.T) {
 
 	callbackLimiter = make(chan struct{}, 1)
 	callbackInflight = sync.Map{}
+	defer waitForCallbackWorkers(t)
 
 	var requestCount int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1017,4 +1026,15 @@ func waitFor(t *testing.T, timeout time.Duration, fn func() bool) {
 		time.Sleep(20 * time.Millisecond)
 	}
 	t.Fatal("condition not satisfied before timeout")
+}
+
+// Database persistence precedes a callback goroutine's deferred cleanup.
+// Drain that cleanup before tests replace globals or close their databases.
+func waitForCallbackWorkers(t *testing.T) {
+	t.Helper()
+	waitFor(t, 3*time.Second, func() bool {
+		idle := true
+		callbackInflight.Range(func(_, _ interface{}) bool { idle = false; return false })
+		return idle
+	})
 }

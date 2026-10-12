@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/GMWalletApp/epusdt/internal/testutil"
@@ -11,55 +12,6 @@ import (
 	"github.com/GMWalletApp/epusdt/model/data"
 	"github.com/GMWalletApp/epusdt/model/mdb"
 )
-
-func TestTronScannerSwitchesNodeAfterFailureThreshold(t *testing.T) {
-	cleanup := testutil.SetupTestDatabases(t)
-	defer cleanup()
-	data.ResetRpcFailoverForTest()
-	t.Cleanup(data.ResetRpcFailoverForTest)
-
-	primary := &mdb.RpcNode{
-		Network: mdb.NetworkTron,
-		Url:     "https://primary-tron.example.com",
-		Type:    mdb.RpcNodeTypeHttp,
-		Weight:  100,
-		Enabled: true,
-		Purpose: mdb.RpcNodePurposeGeneral,
-		Status:  mdb.RpcNodeStatusOk,
-	}
-	backup := &mdb.RpcNode{
-		Network: mdb.NetworkTron,
-		Url:     "https://backup-tron.example.com",
-		Type:    mdb.RpcNodeTypeHttp,
-		Weight:  1,
-		Enabled: true,
-		Purpose: mdb.RpcNodePurposeGeneral,
-		Status:  mdb.RpcNodeStatusOk,
-	}
-	if err := dao.Mdb.Create(primary).Error; err != nil {
-		t.Fatalf("seed primary rpc_node: %v", err)
-	}
-	if err := dao.Mdb.Create(backup).Error; err != nil {
-		t.Fatalf("seed backup rpc_node: %v", err)
-	}
-
-	scanner := NewScanner()
-	scanner.useRpcNode(primary)
-	for i := 0; i < data.RpcFailoverThreshold-1; i++ {
-		scanner.recordRpcFailure("test")
-		if scanner.nodeID != primary.ID {
-			t.Fatalf("node switched before threshold to id=%d", scanner.nodeID)
-		}
-	}
-
-	scanner.recordRpcFailure("test")
-	if scanner.nodeID != backup.ID {
-		t.Fatalf("scanner node id = %d, want backup id=%d", scanner.nodeID, backup.ID)
-	}
-	if scanner.baseURL != backup.Url {
-		t.Fatalf("scanner baseURL = %q, want %q", scanner.baseURL, backup.Url)
-	}
-}
 
 func TestTronScannerStopsOnHistoricalBlockFetchError(t *testing.T) {
 	cleanup := testutil.SetupTestDatabases(t)
@@ -79,19 +31,14 @@ func TestTronScannerStopsOnHistoricalBlockFetchError(t *testing.T) {
 		t.Fatalf("seed rpc_node: %v", err)
 	}
 
+	head := map[string]interface{}{"block_header": map[string]interface{}{"raw_data": map[string]interface{}{"number": 3, "timestamp": 1000}}, "transactions": []interface{}{}}
+	sealTronTestBlock(t, head)
+
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
 		case "/wallet/getnowblock":
-			_ = json.NewEncoder(w).Encode(map[string]interface{}{
-				"block_header": map[string]interface{}{
-					"raw_data": map[string]interface{}{
-						"number":    3,
-						"timestamp": int64(1000),
-					},
-				},
-				"transactions": []interface{}{},
-			})
+			_ = json.NewEncoder(w).Encode(head)
 		case "/wallet/getblockbynum":
 			http.Error(w, "temporary", http.StatusBadGateway)
 		default:
@@ -101,6 +48,9 @@ func TestTronScannerStopsOnHistoricalBlockFetchError(t *testing.T) {
 	defer server.Close()
 
 	node.Url = server.URL
+	if err := dao.Mdb.Model(node).Update("url", server.URL).Error; err != nil {
+		t.Fatal(err)
+	}
 	scanner := NewScanner()
 	scanner.useRpcNode(node)
 	scanner.lastBlock = 1
@@ -122,8 +72,9 @@ func TestTronRPCRecordsRuntimeStats(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{
 				"block_header": map[string]interface{}{
 					"raw_data": map[string]interface{}{
-						"number":    10,
-						"timestamp": int64(1000),
+						"number":     10,
+						"timestamp":  int64(1000),
+						"txTrieRoot": strings.Repeat("0", 64),
 					},
 				},
 				"transactions": []interface{}{},
@@ -132,8 +83,9 @@ func TestTronRPCRecordsRuntimeStats(t *testing.T) {
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{
 				"block_header": map[string]interface{}{
 					"raw_data": map[string]interface{}{
-						"number":    9,
-						"timestamp": int64(1000),
+						"number":     9,
+						"timestamp":  int64(1000),
+						"txTrieRoot": strings.Repeat("0", 64),
 					},
 				},
 				"transactions": []interface{}{},

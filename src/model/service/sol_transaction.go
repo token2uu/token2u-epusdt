@@ -3,10 +3,48 @@ package service
 import (
 	"fmt"
 	"strconv"
+	"strings"
 
+	"github.com/GMWalletApp/epusdt/model/mdb"
 	"github.com/gagliardetto/solana-go"
 	"github.com/tidwall/gjson"
 )
+
+func solGetTransactionTransfers(signature string, watchedAddresses []string, tokens map[string]*mdb.ChainToken) ([]*TransferInfo, error) {
+	var transfers []*TransferInfo
+	_, err := solRetryClientValidated("getTransaction", []interface{}{signature, map[string]interface{}{
+		"encoding": "jsonParsed", "commitment": "finalized", "maxSupportedTransactionVersion": 0,
+	}}, func(body []byte) error {
+		result := gjson.GetBytes(body, "result")
+		signatures := result.Get("transaction.signatures")
+		if !signatures.IsArray() || len(signatures.Array()) == 0 || signatures.Array()[0].Type != gjson.String || signatures.Array()[0].String() != signature {
+			return fmt.Errorf("RPC transaction signature does not match request")
+		}
+		var parseErr error
+		transfers, parseErr = parseSolTransactionTransfers(body, watchedAddresses)
+		if parseErr == nil {
+			for _, transfer := range transfers {
+				if transfer == nil {
+					continue
+				}
+				for _, address := range watchedAddresses {
+					if transfer.Destination == address {
+						if token := tokens[transfer.Mint]; token != nil && (transfer.Decimals == nil || *transfer.Decimals != token.Decimals) {
+							return fmt.Errorf("incoming token decimals do not match configured asset")
+						}
+						stamp := result.Get("blockTime")
+						seconds, err := strconv.ParseInt(stamp.Raw, 10, 64)
+						if stamp.Type != gjson.Number || err != nil || seconds <= 0 || seconds > (1<<63-1)/1000 {
+							return fmt.Errorf("incoming transaction block time is unavailable")
+						}
+					}
+				}
+			}
+		}
+		return parseErr
+	})
+	return transfers, err
+}
 
 // Parse the whole response before applying any payment. A missing array must
 // not look like an empty array and a parse failure must not consume a signature.
@@ -18,6 +56,9 @@ func parseSolTransactionTransfers(body []byte, watchedAddresses []string) ([]*Tr
 	result := gjson.GetBytes(body, "result")
 	if !result.IsObject() || !result.Get("meta").IsObject() || !result.Get("meta.err").Exists() {
 		return nil, fmt.Errorf("missing transaction result or status metadata")
+	}
+	if err := validateSolTransactionStatus(result.Get("meta.err")); err != nil {
+		return nil, err
 	}
 	if result.Get("meta.err").Type != gjson.Null {
 		return nil, nil // A definitively failed transaction cannot credit a payment.
@@ -65,6 +106,79 @@ func parseSolTransactionTransfers(body []byte, watchedAddresses []string) ([]*Tr
 		transfers[i] = transfer
 	}
 	return transfers, nil
+}
+
+func validateSolTransactionStatus(status gjson.Result) error {
+	if status.Type == gjson.Null || status.Type == gjson.String || status.IsObject() {
+		return nil
+	}
+	return fmt.Errorf("invalid transaction error status")
+}
+
+// Validation and scanning use the same case-sensitive parser. In particular,
+// encoding/json's case folding and last-key-wins semantics must not reinterpret
+// a validated success as a failed transaction and then consume its cursor.
+func parseSolSignatureList(body []byte, limit int) ([]solSignatureResult, error) {
+	if !gjson.ValidBytes(body) {
+		return nil, fmt.Errorf("invalid signature JSON")
+	}
+	envelope := gjson.ParseBytes(body)
+	if err := validateSolSignatureFields(envelope); err != nil {
+		return nil, err
+	}
+	result := envelope.Get("result")
+	if !result.IsArray() || len(result.Array()) > limit {
+		return nil, fmt.Errorf("invalid signature list")
+	}
+	batch := make([]solSignatureResult, 0, len(result.Array()))
+	for _, row := range result.Array() {
+		if err := validateSolSignatureFields(row); err != nil {
+			return nil, err
+		}
+		if row.Get("signature").Type != gjson.String || row.Get("signature").String() == "" || !row.Get("err").Exists() {
+			return nil, fmt.Errorf("incomplete signature entry")
+		}
+		slot, err := strconv.ParseUint(row.Get("slot").Raw, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("invalid signature slot")
+		}
+		if err := validateSolTransactionStatus(row.Get("err")); err != nil {
+			return nil, err
+		}
+		entry := solSignatureResult{Signature: row.Get("signature").String(), Slot: slot, Err: row.Get("err").Value()}
+		if stamp := row.Get("blockTime"); stamp.Exists() && stamp.Type != gjson.Null {
+			seconds, err := strconv.ParseInt(stamp.Raw, 10, 64)
+			if stamp.Type != gjson.Number || err != nil || seconds <= 0 {
+				return nil, fmt.Errorf("invalid signature block time")
+			}
+			entry.BlockTime = &seconds
+		}
+		batch = append(batch, entry)
+	}
+	return batch, nil
+}
+
+// Check both the envelope and each signature entry before selecting any key.
+// Key.String also resolves escaped spellings such as "\u0065rr".
+func validateSolSignatureFields(object gjson.Result) error {
+	if !object.IsObject() {
+		return fmt.Errorf("invalid signature response object")
+	}
+	seen := make(map[string]bool)
+	ambiguous := false
+	object.ForEach(func(key, _ gjson.Result) bool {
+		name := strings.ToLower(key.String())
+		if seen[name] {
+			ambiguous = true
+			return false
+		}
+		seen[name] = true
+		return true
+	})
+	if ambiguous {
+		return fmt.Errorf("ambiguous signature response fields")
+	}
+	return nil
 }
 
 func unrelatedSplTransfer(instruction gjson.Result, watchedAddresses []string) bool {

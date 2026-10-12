@@ -75,6 +75,8 @@ func TestSolCursorTransientAccounts(t *testing.T) {
 					row["uiTokenAmount"].(map[string]interface{})["decimals"] = 6
 				}
 				clearProcessedSignatures()
+				data.ResetRpcEndpointPolicyForTest()
+				data.ResetRpcFailoverForTest()
 				scanSolCursor()
 				assertSolCursor(t, l, "B")
 				assertSolCursorSettlement(t, o)
@@ -93,6 +95,8 @@ func TestSolCursorTransientAccounts(t *testing.T) {
 					t.Fatal(err)
 				}
 				clearProcessedSignatures()
+				data.ResetRpcEndpointPolicyForTest()
+				data.ResetRpcFailoverForTest()
 				scanSolCursor()
 				assertSolCursorSettlement(t, o)
 			})

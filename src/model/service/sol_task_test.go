@@ -153,7 +153,7 @@ func TestSolGetBlockHeightDoesNotAffectRpcNodeFailover(t *testing.T) {
 	}
 }
 
-func TestSolRetryClientSwitchesAfterFailureThreshold(t *testing.T) {
+func TestSolRetryClientSwitchesWithinFirstFailedRequest(t *testing.T) {
 	cleanup := testutil.SetupTestDatabases(t)
 	defer cleanup()
 	data.ResetRpcFailoverForTest()
@@ -195,15 +195,6 @@ func TestSolRetryClientSwitchesAfterFailureThreshold(t *testing.T) {
 	}
 	if err := dao.Mdb.Create(&rows).Error; err != nil {
 		t.Fatalf("seed rpc_nodes: %v", err)
-	}
-
-	for i := 0; i < data.RpcFailoverThreshold-1; i++ {
-		if _, err := SolRetryClient("getHealth", nil); err == nil {
-			t.Fatalf("SolRetryClient attempt %d unexpectedly succeeded", i+1)
-		}
-	}
-	if backupCalls != 0 {
-		t.Fatalf("backup calls before threshold = %d, want 0", backupCalls)
 	}
 
 	body, err := SolRetryClient("getHealth", nil)
@@ -272,11 +263,6 @@ func TestSolRetryClientCountsJSONRPCErrorAsNodeFailure(t *testing.T) {
 		t.Fatalf("seed rpc_nodes: %v", err)
 	}
 
-	for i := 0; i < data.RpcFailoverThreshold-1; i++ {
-		if _, err := SolRetryClient("getHealth", nil); err == nil {
-			t.Fatalf("SolRetryClient attempt %d unexpectedly succeeded", i+1)
-		}
-	}
 	body, err := SolRetryClient("getHealth", nil)
 	if err != nil {
 		t.Fatalf("SolRetryClient after JSON-RPC error threshold: %v", err)
@@ -284,8 +270,8 @@ func TestSolRetryClientCountsJSONRPCErrorAsNodeFailure(t *testing.T) {
 	if gjson.GetBytes(body, "result").String() != "ok" {
 		t.Fatalf("response body = %s, want result ok", string(body))
 	}
-	if primaryCalls < data.RpcFailoverThreshold {
-		t.Fatalf("primary calls = %d, want at least threshold", primaryCalls)
+	if primaryCalls != 1 {
+		t.Fatalf("primary calls = %d, want one failed attempt then fallback", primaryCalls)
 	}
 	if backupCalls == 0 {
 		t.Fatal("backup RPC was not called after JSON-RPC error threshold")
@@ -384,7 +370,8 @@ func TestSolCallBackDoesNotCacheSignatureAfterRetryableOrderProcessingError(t *t
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var rpcReq struct {
-			Method string `json:"method"`
+			Method string            `json:"method"`
+			Params []json.RawMessage `json:"params"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&rpcReq); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
@@ -394,6 +381,14 @@ func TestSolCallBackDoesNotCacheSignatureAfterRetryableOrderProcessingError(t *t
 		w.Header().Set("Content-Type", "application/json")
 		switch rpcReq.Method {
 		case "getSignaturesForAddress":
+			var opts struct{ Before string }
+			if len(rpcReq.Params) == 2 {
+				_ = json.Unmarshal(rpcReq.Params[1], &opts)
+			}
+			if opts.Before == sig {
+				_, _ = w.Write([]byte(`{"jsonrpc":"2.0","result":[]}`))
+				return
+			}
 			_ = json.NewEncoder(w).Encode(map[string]interface{}{
 				"jsonrpc": "2.0",
 				"id":      1,
@@ -414,6 +409,7 @@ func TestSolCallBackDoesNotCacheSignatureAfterRetryableOrderProcessingError(t *t
 					"blockTime": blockTime,
 					"meta":      map[string]interface{}{"err": nil},
 					"transaction": map[string]interface{}{
+						"signatures": []string{sig},
 						"message": map[string]interface{}{
 							"instructions": []map[string]interface{}{
 								{

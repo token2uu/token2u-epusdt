@@ -12,6 +12,7 @@ import (
 	"github.com/GMWalletApp/epusdt/model/mdb"
 	"github.com/GMWalletApp/epusdt/model/service"
 	"github.com/GMWalletApp/epusdt/util/log"
+	"github.com/spf13/viper"
 )
 
 const (
@@ -53,6 +54,12 @@ var (
 )
 
 func StartAptosLedgerScannerListener() {
+	// Full-ledger scanning is an explicit rollback mode, never an automatic
+	// fallback from an unavailable indexer (which could spend unbounded credits).
+	if viper.GetString("aptos_scan_mode") != "full_ledger" {
+		startAptosAddressScanner()
+		return
+	}
 	provider := serviceAptosProvider{}
 	cursor := &aptosRuntimeCursor{persistent: true}
 	log.Sugar.Infof("[APTOS] ledger scanner starting mode=full_ledger chunk_size=%d workers=%d queue_limit=%d",

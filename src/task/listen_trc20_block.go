@@ -17,6 +17,7 @@ import (
 	"github.com/GMWalletApp/epusdt/model/mdb"
 	"github.com/GMWalletApp/epusdt/model/service"
 	"github.com/GMWalletApp/epusdt/util/log"
+	"github.com/tidwall/gjson"
 )
 
 const (
@@ -141,28 +142,42 @@ type TransferContractValue struct {
 var httpClient = &http.Client{Timeout: RequestTimeout}
 
 func doPost(url string, apiKey string, body interface{}) ([]byte, error) {
-	data, _ := json.Marshal(body)
+	raw, _, err := doPostNode(mdb.RpcNode{Network: mdb.NetworkTron, Type: mdb.RpcNodeTypeHttp, Url: url, ApiKey: apiKey}, url, body, "")
+	return raw, err
+}
+
+func doPostNode(node mdb.RpcNode, url string, body interface{}, reason string) ([]byte, time.Time, error) {
+	data, marshalErr := json.Marshal(body)
+	if marshalErr != nil {
+		return nil, time.Time{}, marshalErr
+	}
 	req, err := http.NewRequest("POST", url, bytes.NewReader(data))
 	if err != nil {
-		return nil, err
+		return nil, time.Time{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
-	if apiKey = strings.TrimSpace(apiKey); apiKey != "" {
+	if apiKey := strings.TrimSpace(node.ApiKey); apiKey != "" {
 		req.Header.Set("TRON-PRO-API-KEY", apiKey)
 	}
 
-	resp, err := httpClient.Do(req)
+	client := *httpClient
+	client.Timeout = service.RPCRequestTimeout(node, client.Timeout)
+	client.Transport = service.NewRPCTransport(node, reason, httpClient.Transport)
+	resp, err := client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, time.Time{}, service.WrapRPCError(err)
 	}
 	defer resp.Body.Close()
 
-	b, _ := io.ReadAll(resp.Body)
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(b))
+	b, err := io.ReadAll(io.LimitReader(resp.Body, 32<<20))
+	if err != nil {
+		return nil, time.Time{}, err
 	}
-	return b, nil
+	if resp.StatusCode != http.StatusOK {
+		return nil, time.Time{}, service.RPCStatusError(resp.StatusCode)
+	}
+	return b, service.RPCRequestStartedAt(resp), nil
 }
 
 func GetNowBlock(baseURL string, apiKey string) (*Block, error) {
@@ -230,9 +245,15 @@ func parseTRC20Transfer(tx Transaction, tokenMap map[string]mdb.ChainToken) *TRC
 		return nil
 	}
 
-	var val TriggerSmartContractValue
-	if err := json.Unmarshal(c.Parameter.Value, &val); err != nil {
+	if !gjson.ValidBytes(c.Parameter.Value) {
 		return nil
+	}
+	value := gjson.ParseBytes(c.Parameter.Value)
+	val := TriggerSmartContractValue{OwnerAddress: value.Get("owner_address").String(), ContractAddress: value.Get("contract_address").String(), Data: value.Get("data").String()}
+	for _, field := range []string{"owner_address", "contract_address", "data"} {
+		if value.Get(field).Type != gjson.String {
+			return nil
+		}
 	}
 
 	contractHex := normalizeTronHexAddress(val.ContractAddress)
@@ -297,10 +318,18 @@ func parseTRXTransfer(tx Transaction) *TRXTransfer {
 		return nil
 	}
 
-	var val TransferContractValue
-	if err := json.Unmarshal(c.Parameter.Value, &val); err != nil {
+	if !gjson.ValidBytes(c.Parameter.Value) {
 		return nil
 	}
+	value := gjson.ParseBytes(c.Parameter.Value)
+	if value.Get("owner_address").Type != gjson.String || value.Get("to_address").Type != gjson.String {
+		return nil
+	}
+	amount, err := strconv.ParseInt(value.Get("amount").Raw, 10, 64)
+	if err != nil {
+		return nil
+	}
+	val := TransferContractValue{OwnerAddress: value.Get("owner_address").String(), ToAddress: value.Get("to_address").String(), Amount: amount}
 	if val.Amount <= 0 {
 		return nil
 	}
@@ -376,9 +405,9 @@ func (s *Scanner) Init() error {
 	s.useRpcNode(node)
 
 	log.Sugar.Infof("[TRON-BLOCK] using RPC node %s", s.nodeLabel)
-	block, err := GetNowBlock(s.baseURL, s.apiKey)
+	block, err := s.fetchBlock(nil)
 	if err != nil {
-		s.recordRpcFailure("initial get latest block")
+
 		return fmt.Errorf("获取初始块失败: %w", err)
 	}
 	s.lastBlock = block.BlockHeader.RawData.Number
@@ -436,10 +465,12 @@ func (s *Scanner) Run() {
 }
 
 func (s *Scanner) poll() {
-	latest, err := GetNowBlock(s.baseURL, s.apiKey)
+	var scanErr error = fmt.Errorf("TRON scan incomplete")
+	defer func() { data.RecordRpcScanResult(mdb.NetworkTron, scanErr) }()
+	latest, err := s.fetchBlock(nil)
 	if err != nil {
 		log.Sugar.Warnf("[TRON-BLOCK] get latest block: %v", err)
-		s.recordRpcFailure("get latest block")
+
 		return
 	}
 	latestNum := latest.BlockHeader.RawData.Number
@@ -453,6 +484,7 @@ func (s *Scanner) poll() {
 	}
 	if latestNum <= s.lastBlock {
 		data.RecordRpcNodeSuccess(s.nodeID)
+		scanErr = nil
 		return
 	}
 
@@ -467,7 +499,7 @@ func (s *Scanner) poll() {
 		if num == latest.BlockHeader.RawData.Number {
 			block = latest
 		} else {
-			block, err = GetBlockByNum(s.baseURL, s.apiKey, num)
+			block, err = s.fetchBlock(&num)
 			if err != nil {
 				log.Sugar.Warnf("[TRON-BLOCK] get block %d: %v", num, err)
 				hadBlockFetchError = true
@@ -499,28 +531,65 @@ func (s *Scanner) poll() {
 		}
 	}
 	if hadBlockFetchError {
-		s.recordRpcFailure("get historical block")
+
 		return
 	}
 	data.RecordRpcNodeSuccess(s.nodeID)
+	scanErr = nil
 }
 
-func (s *Scanner) recordRpcFailure(reason string) {
-	failures, cooling := data.RecordRpcNodeFailure(s.nodeID)
-	if !cooling {
-		log.Sugar.Warnf("[TRON-BLOCK] RPC node failed (%s), node=%s failures=%d/%d", reason, s.nodeLabel, failures, data.RpcFailoverThreshold)
-		return
+// Resolve on every read so recovery returns traffic from a paid node to public
+// nodes. All attempts fetch the same block; only poll() commits the cursor.
+func (s *Scanner) fetchBlock(number *int64) (*Block, error) {
+	tried := []uint64{}
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		node, err := service.ResolveTronRpcNode(tried...)
+		if err != nil {
+			if lastErr != nil {
+				return nil, lastErr
+			}
+			return nil, err
+		}
+		s.useRpcNode(node)
+		path, body := "/wallet/getnowblock", map[string]interface{}{}
+		if number != nil {
+			path = "/wallet/getblockbynum"
+			body["num"] = *number
+		}
+		raw, requestStarted, err := doPostNode(*node, s.baseURL+path, body, service.RPCErrorReason(lastErr))
+		var block Block
+		if err == nil {
+			err = validateTronBlockResponse(raw, number)
+			if err == nil {
+				block = decodeValidatedTronBlock(raw)
+			}
+			if err == nil && number == nil && !data.ObserveRpcHead(*node, block.BlockHeader.RawData.Number, requestStarted) {
+				err = &service.RPCRequestError{Reason: "stale_head"}
+			}
+		}
+		if err == nil {
+			data.RecordRpcNodeSuccess(node.ID)
+			data.RecordRpcSuccess(mdb.NetworkTron)
+			if number == nil {
+				data.RecordRpcBlockHeight(mdb.NetworkTron, block.BlockHeader.RawData.Number)
+			}
+			return &block, nil
+		}
+		lastErr = err
+		data.RecordRpcFailure(mdb.NetworkTron)
+		if service.RPCErrorReason(err) == "local_capacity" {
+			tried = append(tried, node.ID)
+			continue
+		}
+		data.RecordRpcNodeFailure(node.ID)
+		if service.RPCErrorReason(err) != "rate_limited" {
+			data.CooldownRpcEndpoint(*node, "")
+		}
+		log.Sugar.Warnf("[TRON-BLOCK] RPC failed node=%s reason=%s; trying alternate", data.RpcNodeLogLabel(*node), service.RPCErrorReason(err))
+		tried = append(tried, node.ID)
 	}
-
-	log.Sugar.Warnf("[TRON-BLOCK] RPC node reached fail threshold (%s), node=%s, trying another node", reason, s.nodeLabel)
-	node, err := service.ResolveTronRpcNode(s.nodeID)
-	if err != nil {
-		log.Sugar.Warnf("[TRON-BLOCK] no alternate RPC node available after failure, keep current node=%s: %v", s.nodeLabel, err)
-		return
-	}
-	oldLabel := s.nodeLabel
-	s.useRpcNode(node)
-	log.Sugar.Warnf("[TRON-BLOCK] switched RPC node from %s to %s", oldLabel, s.nodeLabel)
+	return nil, lastErr
 }
 
 func StartTronBlockScannerListener() {

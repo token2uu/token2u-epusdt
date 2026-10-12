@@ -16,13 +16,13 @@ import (
 type CreateRpcNodeRequest struct {
 	Network string `json:"network" validate:"required" example:"tron"`
 	Url     string `json:"url" validate:"required" example:"https://api.trongrid.io"`
-	// 连接类型 http=HTTP请求 ws=WebSocket长连接 lite=TON liteserver配置
-	Type    string `json:"type" validate:"required|in:http,ws,lite" enums:"http,ws,lite" example:"http"`
+	// 连接类型 http=HTTP请求 ws=WebSocket长连接 lite=TON配置 indexer=Aptos GraphQL
+	Type    string `json:"type" validate:"required|in:http,ws,lite,indexer" enums:"http,ws,lite,indexer" example:"http"`
 	Weight  int    `json:"weight" example:"1"`
 	ApiKey  string `json:"api_key" example:""`
 	Enabled *bool  `json:"enabled" example:"true"`
-	// 用途 general=通用 manual_verify=补单专用 both=通用+补单
-	Purpose string `json:"purpose" enums:"general,manual_verify,both" example:"general"`
+	// 用途 general=通用 manual_verify=补单专用 both=通用+补单 paid_fallback=付费兜底
+	Purpose string `json:"purpose" enums:"general,manual_verify,both,paid_fallback" example:"general"`
 }
 
 // UpdateRpcNodeRequest is the payload for updating an RPC node.
@@ -31,7 +31,7 @@ type UpdateRpcNodeRequest struct {
 	Weight  *int    `json:"weight" example:"1"`
 	ApiKey  *string `json:"api_key" example:"your-api-key"`
 	Enabled *bool   `json:"enabled" example:"true"`
-	Purpose *string `json:"purpose" enums:"general,manual_verify,both" example:"manual_verify"`
+	Purpose *string `json:"purpose" enums:"general,manual_verify,both,paid_fallback" example:"manual_verify"`
 }
 
 // ListRpcNodes returns rows optionally filtered by network.
@@ -87,6 +87,9 @@ func (c *BaseAdminController) CreateRpcNode(ctx echo.Context) error {
 	}
 	nodeURL := strings.TrimSpace(req.Url)
 	nodeType := strings.ToLower(strings.TrimSpace(req.Type))
+	if nodeType == mdb.RpcNodeTypeIndexer && strings.ToLower(strings.TrimSpace(req.Network)) != mdb.NetworkAptos {
+		return c.FailJson(ctx, constant.RpcNodeTypeErr)
+	}
 	if err := validateRpcNodeURLForType(nodeURL, nodeType); err != nil {
 		return c.FailJson(ctx, err)
 	}
@@ -187,8 +190,8 @@ func (c *BaseAdminController) DeleteRpcNode(ctx echo.Context) error {
 }
 
 // HealthCheckRpcNode performs an on-demand probe and writes the result.
-// For HTTP/WS/lite endpoints this is a TCP-level check against the configured
-// URL host. TON lite rows usually point to a global.config.json HTTPS URL.
+// Solana/TRON/Aptos HTTP and Indexer nodes use a real protocol/head probe.
+// Other networks and WS/lite endpoints retain a TCP-level connectivity check.
 // @Summary      Health check RPC node
 // @Description  Perform an on-demand health probe on an RPC node
 // @Tags         Admin RPC Nodes
@@ -210,7 +213,10 @@ func (c *BaseAdminController) HealthCheckRpcNode(ctx echo.Context) error {
 	if row.ID == 0 {
 		return c.FailJson(ctx, constant.RpcNodeNotFoundErr)
 	}
-	status, latency := task.ProbeNode(row.Url)
+	status, latency, err := task.ProbeConfiguredRpcNode(*row)
+	if err != nil {
+		return c.FailJson(ctx, err)
+	}
 	if err := data.UpdateRpcNodeHealth(id, status, latency); err != nil {
 		return c.FailJson(ctx, err)
 	}
@@ -226,7 +232,7 @@ func rpcNodePurposeFromRequest(raw string) (string, error) {
 		return mdb.RpcNodePurposeGeneral, nil
 	}
 	switch purpose {
-	case mdb.RpcNodePurposeGeneral, mdb.RpcNodePurposeManualVerify, mdb.RpcNodePurposeBoth:
+	case mdb.RpcNodePurposeGeneral, mdb.RpcNodePurposeManualVerify, mdb.RpcNodePurposeBoth, mdb.RpcNodePurposePaidFallback:
 		return purpose, nil
 	default:
 		return "", constant.RpcNodePurposeErr
@@ -242,7 +248,7 @@ func validateRpcNodeURLForType(rawURL string, nodeType string) error {
 	}
 	scheme := strings.ToLower(parsed.Scheme)
 	switch nodeType {
-	case mdb.RpcNodeTypeHttp:
+	case mdb.RpcNodeTypeHttp, mdb.RpcNodeTypeIndexer:
 		if scheme == "http" || scheme == "https" {
 			return nil
 		}

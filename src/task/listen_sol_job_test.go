@@ -13,6 +13,7 @@ import (
 )
 
 func TestListenSolJobRecordsRuntimeBlockHeight(t *testing.T) {
+	resetSolanaSchedule(t)
 	cleanup := testutil.SetupTestDatabases(t)
 	defer cleanup()
 	data.ResetRpcRuntimeStatsForTest()
@@ -21,7 +22,8 @@ func TestListenSolJobRecordsRuntimeBlockHeight(t *testing.T) {
 	methodCalls := make(map[string]int)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
-			Method string `json:"method"`
+			Method string            `json:"method"`
+			Params []json.RawMessage `json:"params"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		methodCalls[req.Method]++
@@ -33,6 +35,14 @@ func TestListenSolJobRecordsRuntimeBlockHeight(t *testing.T) {
 				"id":      1,
 				"result":  int64(654321),
 			})
+			return
+		}
+		var opts struct{ Before string }
+		if len(req.Params) == 2 {
+			_ = json.Unmarshal(req.Params[1], &opts)
+		}
+		if opts.Before == "solana-test-signature" {
+			_, _ = w.Write([]byte(`{"jsonrpc":"2.0","result":[]}`))
 			return
 		}
 
@@ -83,8 +93,8 @@ func TestListenSolJobRecordsRuntimeBlockHeight(t *testing.T) {
 
 	ListenSolJob{}.Run()
 
-	if methodCalls["getSignaturesForAddress"] != 1 {
-		t.Fatalf("getSignaturesForAddress calls = %d, want 1", methodCalls["getSignaturesForAddress"])
+	if methodCalls["getSignaturesForAddress"] != 2 {
+		t.Fatalf("getSignaturesForAddress calls = %d, want 2 including the empty final page", methodCalls["getSignaturesForAddress"])
 	}
 	if methodCalls["getBlockHeight"] != 1 {
 		t.Fatalf("getBlockHeight calls = %d, want 1", methodCalls["getBlockHeight"])
@@ -92,8 +102,8 @@ func TestListenSolJobRecordsRuntimeBlockHeight(t *testing.T) {
 
 	stats := data.SnapshotRpcRuntimeStats()
 	solana := stats[mdb.NetworkSolana]
-	if solana.SuccessCount != 2 {
-		t.Fatalf("solana success_count = %d, want 2", solana.SuccessCount)
+	if solana.SuccessCount != 3 {
+		t.Fatalf("solana success_count = %d, want 3", solana.SuccessCount)
 	}
 	if solana.FailureCount != 0 {
 		t.Fatalf("solana failure_count = %d, want 0", solana.FailureCount)

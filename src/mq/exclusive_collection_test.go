@@ -20,6 +20,7 @@ func TestExclusiveCallbackRetriesActualAmountAndClosesLatePayment(t *testing.T) 
 	defer testutil.SetupTestDatabases(t)()
 	callbackLimiter = make(chan struct{}, 1)
 	callbackInflight = sync.Map{}
+	defer waitForCallbackWorkers(t)
 	requests := make(chan url.Values, 8)
 	count := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

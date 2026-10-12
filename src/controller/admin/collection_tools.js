@@ -3,12 +3,44 @@
 (() => {
   'use strict';
   let lastPath = '', notice;
+  function updateNavigation(path) {
+    document.getElementById('collection-admin-link')?.remove();
+    const signedIn = document.cookie.split('; ').some(v => v.startsWith('access_token='));
+    if (!signedIn || path.startsWith('/sign-in') || path.startsWith('/cashier/')) {
+      document.querySelectorAll('[data-collection-nav]').forEach(item => item.remove());
+      return;
+    }
+    // The upstream app renders desktop and mobile sidebars separately. Attach
+    // to each rendered menu, including sidebars mounted after this script.
+    for (const template of document.querySelectorAll('[data-sidebar="menu-button"][href="/orders"]')) {
+      const menuItem = template.closest('[data-sidebar="menu-item"]');
+      const menu = menuItem?.parentElement;
+      if (!menu || menu.querySelector('[data-collection-nav]')) continue;
+      const item = document.createElement('li');
+      item.className = menuItem.className;
+      item.setAttribute('data-sidebar', 'menu-item');
+      item.setAttribute('data-slot', 'sidebar-menu-item');
+      item.setAttribute('data-collection-nav', '');
+      const link = document.createElement('a');
+      link.href = '/admin/collections';
+      link.className = template.className;
+      link.setAttribute('data-sidebar', 'menu-button');
+      link.setAttribute('data-slot', 'sidebar-menu-button');
+      link.setAttribute('data-size', 'default');
+      link.setAttribute('data-active', 'false');
+      link.setAttribute('aria-label', '到账与异常记录');
+      link.title = '到账与异常记录';
+      link.innerHTML = '<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M8 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-3"/><path d="M16 3h5v5M10 14 21 3M8 10H7M7 14h1M7 18h8"/></svg><span>到账与异常记录</span>';
+      item.append(link);
+      menuItem.after(item);
+    }
+  }
   async function update() {
     const path = location.pathname;
+    updateNavigation(path);
     if (path === lastPath) return;
     lastPath = path;
     if (notice) { notice.remove(); notice = null; }
-    document.getElementById('collection-admin-link')?.remove();
     const match = path.match(/^\/cashier\/([^/]+)$/);
     if (match) {
       try {
@@ -21,12 +53,14 @@
         notice.style.cssText = 'padding:12px 20px;background:#fffbeb;color:#78350f;font:14px/1.6 system-ui;border-bottom:1px solid #fde68a;';
         document.body.prepend(notice);
       } catch { lastPath = ''; }
-    } else if (document.cookie.split('; ').some(v => v.startsWith('access_token=')) && !path.startsWith('/sign-in')) {
-      const link = document.createElement('a');
-      link.id = 'collection-admin-link'; link.href = '/admin/collections'; link.textContent = '到账与异常记录';
-      link.style.cssText = 'position:fixed;right:16px;bottom:16px;z-index:40;background:#1e293b;color:#fff;padding:12px 16px;border-radius:8px;font:14px system-ui;box-shadow:0 2px 8px #0002;';
-      document.body.append(link);
     }
   }
+  let pending = false;
+  // Mobile navigation is rendered in a portal outside #app.
+  if (document.body) new MutationObserver(() => {
+    if (pending) return;
+    pending = true;
+    requestAnimationFrame(() => { pending = false; update(); });
+  }).observe(document.body, { childList: true, subtree: true });
   update(); window.addEventListener('popstate', update); setInterval(update, 1000);
 })();

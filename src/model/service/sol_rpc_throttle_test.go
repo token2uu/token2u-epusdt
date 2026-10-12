@@ -142,7 +142,7 @@ func TestSolRPCCooldownHonorsHTTPDateAndDoesNotShorten(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if !errors.Is(g.wait(ctx, "other endpoint"), context.Canceled) {
+	if !errors.Is(waitRPCAdmission(ctx, mdb.RpcNode{Network: mdb.NetworkSolana}), context.Canceled) {
 		t.Fatal("throttle ignored canceled request")
 	}
 }

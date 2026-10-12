@@ -294,7 +294,7 @@ func TestSelectGeneralRpcNodeSkipsCoolingNode(t *testing.T) {
 	}
 }
 
-func TestSelectGeneralRpcNodeFallsBackWhenAllNodesCooling(t *testing.T) {
+func TestSelectGeneralRpcNodeWaitsWhenAllNodesCooling(t *testing.T) {
 	cleanup := testutil.SetupTestDatabases(t)
 	defer cleanup()
 	ResetRpcFailoverForTest()
@@ -317,8 +317,8 @@ func TestSelectGeneralRpcNodeFallsBackWhenAllNodesCooling(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SelectGeneralRpcNode(): %v", err)
 	}
-	if got == nil || got.Url != "https://primary.example.com" {
-		t.Fatalf("SelectGeneralRpcNode() = %#v, want primary when every node is cooling", got)
+	if got != nil {
+		t.Fatalf("SelectGeneralRpcNode() = %#v, must respect cooldown when all nodes are cooling", got)
 	}
 }
 

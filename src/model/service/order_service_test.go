@@ -884,7 +884,7 @@ func TestTryProcessTonJettonTransferMarksUSDTOrderPaid(t *testing.T) {
 
 	transfer := &TonObservedTransfer{
 		ReceiveAddress: resp.ReceiveAddress,
-		Token:          mdb.ChainToken{BaseModel: mdb.BaseModel{ID: 2}, Network: mdb.NetworkTon, Symbol: "USDT", Decimals: 6, Enabled: true},
+		Token:          mdb.ChainToken{BaseModel: mdb.BaseModel{ID: 2}, Network: mdb.NetworkTon, Symbol: "USDT", ContractAddress: "0:b113a994b5024a16719f69139328eb759596c38a25f59028b146fecdc3621dfe", Decimals: 6, Enabled: true},
 		RawAmount:      big.NewInt(1_000_000),
 		Amount:         resp.ActualAmount,
 		BlockTimeMs:    time.Now().Add(time.Second).UnixMilli(),

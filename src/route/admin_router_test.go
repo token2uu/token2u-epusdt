@@ -790,6 +790,26 @@ func TestAdminOrders_CloseWaitSelectOrder(t *testing.T) {
 	}
 }
 
+func TestAdminOrders_CloseNeverReleasesReassignedAmount(t *testing.T) {
+	e, token := setupAdminTestEnv(t)
+	order := &mdb.Orders{TradeId: "old-close", OrderId: "old-close", Network: "tron", Token: "USDT", ReceiveAddress: "wallet", ActualAmount: 5, Amount: 35, Status: mdb.StatusWaitPay}
+	if err := dao.Mdb.Create(order).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := data.LockTransaction(order.Network, order.ReceiveAddress, order.Token, "new-owner", 5, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	assertOK(t, doPostAdmin(e, "/admin/api/v1/orders/"+order.TradeId+"/close", nil, token))
+	locked, err := data.GetTradeIdByWalletAddressAndAmountAndToken(order.Network, order.ReceiveAddress, order.Token, 5)
+	if err != nil || locked != "new-owner" {
+		t.Fatalf("manual close deleted new reservation: %s %v", locked, err)
+	}
+	got, err := data.GetOrderInfoByTradeId(order.TradeId)
+	if err != nil || got.Status != mdb.StatusExpired || got.ClosedReason != mdb.OrderClosedManual {
+		t.Fatalf("close provenance missing: %+v %v", got, err)
+	}
+}
+
 // TestAdminOrders_MarkPaidNotFound verifies mark-paid on non-existent order.
 func TestAdminOrders_MarkPaidNotFound(t *testing.T) {
 	e, token := setupAdminTestEnv(t)

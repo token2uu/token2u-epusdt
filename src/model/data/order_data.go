@@ -2,13 +2,16 @@ package data
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
+	"github.com/GMWalletApp/epusdt/config"
 	"github.com/GMWalletApp/epusdt/model/dao"
 	"github.com/GMWalletApp/epusdt/model/mdb"
 	"github.com/GMWalletApp/epusdt/model/request"
 	addressutil "github.com/GMWalletApp/epusdt/util/address"
+	"github.com/GMWalletApp/epusdt/util/constant"
 	"github.com/dromara/carbon/v2"
 	"github.com/shopspring/decimal"
 	"gorm.io/gorm"
@@ -76,6 +79,12 @@ func applyOrderReceiveAddressFilter(tx *gorm.DB, network, address string) *gorm.
 	if isEVMNetwork(network) {
 		return tx.Where("lower(receive_address) = ?", address)
 	}
+	if network == mdb.NetworkTon {
+		if parsed, err := addressutil.ParseTonMainnetAddress(address); err == nil {
+			// Legacy rows store the friendly form; exclusive rows use raw keys.
+			return tx.Where("(receive_address IN ? OR lower(receive_address) = ?)", []string{parsed.Display, parsed.Address.Bounce(true).String()}, parsed.Raw)
+		}
+	}
 	return tx.Where("receive_address = ?", address)
 }
 
@@ -117,8 +126,45 @@ func GetOrderInfoByTradeId(tradeId string) (*mdb.Orders, error) {
 	return order, err
 }
 
+// Both precision and deadline belong to the actual reservation, not to settings
+// read later while the business database is busy.
+func orderReservation(order *mdb.Orders) (*mdb.TransactionLock, error) {
+	var lock mdb.TransactionLock
+	if err := dao.RuntimeDB.Where("trade_id = ?", order.TradeId).Find(&lock).Error; err != nil {
+		return nil, err
+	}
+	if lock.ID == 0 || !lock.ExpiresAt.After(time.Now()) || lock.Network != normalizeLockNetwork(order.Network) ||
+		lock.Address != normalizeLockAddress(order.Network, order.ReceiveAddress) || lock.Token != normalizeLockToken(order.Token) || !lockMatchesAmount(lock, order.ActualAmount) {
+		return nil, constant.OrderStatusConflict
+	}
+	return &lock, nil
+}
+
 // CreateOrderWithTransaction creates an order in the active database transaction.
 func CreateOrderWithTransaction(tx *gorm.DB, order *mdb.Orders) error {
+	if order.CollectionMode != mdb.CollectionExclusive && order.ReceiveAddress != "" && (order.PayProvider == "" || order.PayProvider == mdb.PaymentProviderOnChain) {
+		lock, err := orderReservation(order)
+		if err != nil {
+			return err
+		}
+		precision := NormalizeAmountPrecision(lock.AmountPrecision)
+		order.AmountPrecision = &precision
+		if order.PaymentExpiresAt == nil || order.PaymentExpiresAt.After(lock.ExpiresAt) {
+			deadline := lock.ExpiresAt
+			order.PaymentExpiresAt = &deadline
+		}
+		if order.AssignedAtMs == 0 && order.CreatedAt.StdTime().IsZero() {
+			order.AssignedAtMs = time.Now().UnixMilli()
+		}
+	}
+	if order.PaymentExpiresAt == nil {
+		created := order.CreatedAt.StdTime()
+		if created.IsZero() {
+			created = time.Now()
+		}
+		deadline := created.Add(config.GetOrderExpirationTimeDuration())
+		order.PaymentExpiresAt = &deadline
+	}
 	return tx.Model(order).Create(order).Error
 }
 
@@ -179,6 +225,81 @@ func GetOrderByBlockTransactionIDsCaseInsensitive(blockIDs []string) (*mdb.Order
 	return order, err
 }
 
+// SettleOrderGroupWithTransaction commits legacy payment, parent callback and
+// sibling closure together. A failed parent write must roll back the child too.
+// Callers serialize settlement with CollectionMu and release runtime locks only
+// after this transaction commits, by the returned original trade IDs.
+func SettleOrderGroupWithTransaction(tx *gorm.DB, req *request.OrderProcessingRequest, allowedStatuses, parentAllowedStatuses []int, authenticatedProvider bool) ([]mdb.Orders, error) {
+	var order mdb.Orders
+	if err := tx.Where("trade_id = ?", req.TradeId).First(&order).Error; err != nil {
+		return nil, err
+	}
+	existing, err := GetOrderByBlockIdWithTransaction(tx, req.BlockTransactionId)
+	if err != nil {
+		return nil, err
+	}
+	if existing.ID > 0 {
+		return nil, constant.OrderBlockAlreadyProcess
+	}
+	allowed := func(status int, statuses []int) bool {
+		for _, candidate := range statuses {
+			if candidate == status {
+				return true
+			}
+		}
+		return false
+	}
+	if !allowed(order.Status, allowedStatuses) {
+		return nil, constant.OrderStatusConflict
+	}
+	root := &order
+	if order.ParentTradeId != "" {
+		root = &mdb.Orders{}
+		if err := tx.Where("trade_id = ?", order.ParentTradeId).First(root).Error; err != nil {
+			return nil, err
+		}
+		if !allowed(root.Status, parentAllowedStatuses) {
+			// Only a verified provider callback can recover this migration-only
+			// closure. Recheck its independent checkout inside the settlement tx.
+			if !authenticatedProvider || root.Status != mdb.StatusExpired || root.ClosedReason != mdb.OrderClosedReservationUnknown ||
+				root.BlockTransactionId != "" || root.PayBySubId != 0 || order.PayProvider != mdb.PaymentProviderOkPay ||
+				order.Status != mdb.StatusWaitPay || order.BlockTransactionId != "" || order.PayBySubId != 0 ||
+				!PaymentDeadline(&order).After(time.Now()) {
+				return nil, constant.OrderStatusConflict
+			}
+			var provider mdb.ProviderOrder
+			if err := tx.Where("trade_id = ? AND provider = ?", order.TradeId, order.PayProvider).Find(&provider).Error; err != nil {
+				return nil, err
+			}
+			if provider.ID == 0 || provider.Status != mdb.ProviderOrderStatusPending || provider.ProviderOrderID == "" ||
+				provider.ProviderOrderID != req.BlockTransactionId || !strings.EqualFold(provider.Coin, order.Token) ||
+				provider.Amount <= 0 || provider.Amount != order.ActualAmount || req.Amount != order.ActualAmount {
+				return nil, constant.OrderStatusConflict
+			}
+		}
+	}
+	paid := decimal.Zero
+	if req.PaidAmount > 0 && req.PaidAmount != order.ActualAmount {
+		if order.ActualAmount <= 0 || order.Amount <= 0 {
+			return nil, fmt.Errorf("invalid settlement amount")
+		}
+		paid = decimal.NewFromFloat(req.PaidAmount).Mul(decimal.NewFromFloat(order.Amount)).Div(decimal.NewFromFloat(order.ActualAmount)).Round(2)
+		if !paid.IsPositive() {
+			return nil, fmt.Errorf("payment below settlement precision")
+		}
+	}
+	crypto := req.Amount
+	if req.PaidAmount > 0 {
+		crypto = req.PaidAmount
+	}
+	if err := settleObservedPaymentTx(tx, &order, root, paid, decimal.NewFromFloat(crypto).String(), req.BlockTransactionId, time.Now()); err != nil {
+		return nil, err
+	}
+	var group []mdb.Orders
+	err = tx.Where("trade_id = ? OR parent_trade_id = ?", root.TradeId, root.TradeId).Find(&group).Error
+	return group, err
+}
+
 // OrderSuccessWithTransaction marks an order as paid only if it is still waiting for payment.
 func OrderSuccessWithTransaction(tx *gorm.DB, req *request.OrderProcessingRequest) (bool, error) {
 	return OrderSuccessWithStatusesWithTransaction(tx, req, []int{mdb.StatusWaitPay})
@@ -195,6 +316,8 @@ func OrderSuccessWithStatusesWithTransaction(tx *gorm.DB, req *request.OrderProc
 		Where("status IN ?", allowedStatuses).
 		Updates(map[string]interface{}{
 			"block_transaction_id": req.BlockTransactionId,
+			"released_at_ms":       time.Now().UnixMilli(),
+			"closed_reason":        "",
 			"status":               mdb.StatusPaySuccess,
 			"callback_confirm":     mdb.CallBackConfirmNo,
 		})
@@ -220,6 +343,8 @@ func OrderSuccessWithPaidAmount(tx *gorm.DB, req *request.OrderProcessingRequest
 
 	updates := map[string]interface{}{
 		"block_transaction_id": req.BlockTransactionId,
+		"released_at_ms":       time.Now().UnixMilli(),
+		"closed_reason":        "",
 		"status":               mdb.StatusPaySuccess,
 		"callback_confirm":     mdb.CallBackConfirmNo,
 	}
@@ -265,6 +390,7 @@ func SaveCallBackOrdersResp(order *mdb.Orders) error {
 	return dao.Mdb.Model(order).
 		Where("id = ?", order.ID).
 		Where("callback_confirm = ?", mdb.CallBackConfirmNo).
+		Where("status = ? AND block_transaction_id = ? AND callback_num = ?", order.Status, order.BlockTransactionId, order.CallbackNum).
 		Updates(map[string]interface{}{
 			"callback_num":     gorm.Expr("callback_num + ?", 1),
 			"callback_confirm": order.CallBackConfirm,
@@ -274,18 +400,42 @@ func SaveCallBackOrdersResp(order *mdb.Orders) error {
 // UpdateOrderIsExpirationById expires an order only if it is still pending and already timed out.
 // When withCallback is true, callback_confirm is also set so the MQ worker dispatches a notification.
 func UpdateOrderIsExpirationById(id uint64, expirationCutoff time.Time, withCallback bool) (bool, error) {
-	updates := map[string]interface{}{
-		"status": mdb.StatusExpired,
-	}
-	if withCallback {
-		updates["callback_confirm"] = mdb.CallBackConfirmNo
-	}
-	result := dao.Mdb.Model(mdb.Orders{}).
-		Where("id = ?", id).
-		Where("status IN ?", []int{mdb.StatusWaitPay, mdb.StatusWaitSelect}).
-		Where("created_at <= ?", expirationCutoff).
-		Updates(updates)
-	return result.RowsAffected > 0, result.Error
+	var expired bool
+	err := dao.Mdb.Transaction(func(tx *gorm.DB) error {
+		var order mdb.Orders
+		if err := tx.Where("id = ?", id).Find(&order).Error; err != nil {
+			return err
+		}
+		if order.ID == 0 || (order.Status != mdb.StatusWaitPay && order.Status != mdb.StatusWaitSelect) {
+			return nil
+		}
+		deadline := PaymentDeadline(&order)
+		if order.PaymentExpiresAt != nil {
+			if deadline.After(time.Now()) {
+				return nil
+			}
+		} else if order.CreatedAt.StdTime().After(expirationCutoff) {
+			return nil
+		}
+		updates := map[string]interface{}{
+			"status": mdb.StatusExpired, "closed_reason": mdb.OrderClosedExpired,
+			"released_at_ms": time.Now().UnixMilli(), "payment_expires_at": deadline,
+		}
+		if withCallback {
+			updates["callback_confirm"] = mdb.CallBackConfirmNo
+		}
+		q := tx.Model(&mdb.Orders{}).Where("id = ? AND status = ?", id, order.Status)
+		if order.PaymentExpiresAt == nil {
+			q = q.Where("payment_expires_at IS NULL AND created_at <= ?", expirationCutoff)
+		} else {
+			q = q.Where("payment_expires_at <= ?", time.Now())
+			delete(updates, "payment_expires_at")
+		}
+		result := q.Updates(updates)
+		expired = result.RowsAffected > 0
+		return result.Error
+	})
+	return expired, err
 }
 
 // CountActiveSubOrders counts sub-orders with status=WaitPay under a parent.
@@ -358,6 +508,8 @@ func MarkParentOrderSuccessWithStatusesWithTransaction(tx *gorm.DB, parentTradeI
 			"status":           mdb.StatusPaySuccess,
 			"callback_confirm": mdb.CallBackConfirmNo,
 			"pay_by_sub_id":    sub.ID,
+			"released_at_ms":   time.Now().UnixMilli(),
+			"closed_reason":    "",
 		})
 	return result.RowsAffected > 0, result.Error
 }
@@ -369,7 +521,7 @@ func ExpireSiblingSubOrdersWithTransaction(tx *gorm.DB, parentTradeId string, ex
 		Where("parent_trade_id = ?", parentTradeId).
 		Where("trade_id != ?", excludeTradeId).
 		Where("status = ?", mdb.StatusWaitPay).
-		Update("status", mdb.StatusExpired).Error
+		Updates(map[string]interface{}{"status": mdb.StatusExpired, "closed_reason": mdb.OrderClosedSuperseded, "released_at_ms": time.Now().UnixMilli()}).Error
 }
 
 // MarkOrderSelected sets is_selected=true for the given trade_id.
@@ -383,17 +535,25 @@ func MarkOrderSelected(tradeId string) error {
 // and makes it payable. It only updates status=WaitSelect rows so concurrent
 // switch-network attempts cannot overwrite a payable order.
 func CompleteWaitSelectOrder(tradeID string, network string, token string, receiveAddress string, actualAmount float64) (bool, error) {
+	lock, err := orderReservation(&mdb.Orders{TradeId: tradeID, Network: network, Token: token, ReceiveAddress: receiveAddress, ActualAmount: actualAmount})
+	if err != nil {
+		return false, err
+	}
+	now := time.Now()
 	result := dao.Mdb.Model(&mdb.Orders{}).
 		Where("trade_id = ?", tradeID).
 		Where("status = ?", mdb.StatusWaitSelect).
 		Updates(map[string]interface{}{
-			"status":          mdb.StatusWaitPay,
-			"network":         strings.ToLower(strings.TrimSpace(network)),
-			"token":           strings.ToUpper(strings.TrimSpace(token)),
-			"receive_address": receiveAddress,
-			"actual_amount":   actualAmount,
-			"is_selected":     false,
-			"created_at":      time.Now(),
+			"status":             mdb.StatusWaitPay,
+			"network":            strings.ToLower(strings.TrimSpace(network)),
+			"token":              strings.ToUpper(strings.TrimSpace(token)),
+			"receive_address":    receiveAddress,
+			"actual_amount":      actualAmount,
+			"amount_precision":   NormalizeAmountPrecision(lock.AmountPrecision),
+			"is_selected":        false,
+			"created_at":         now,
+			"assigned_at_ms":     now.UnixMilli(),
+			"payment_expires_at": lock.ExpiresAt,
 		})
 	return result.RowsAffected > 0, result.Error
 }
@@ -406,14 +566,15 @@ func CompleteWaitSelectOkPayOrderWithTransaction(tx *gorm.DB, tradeID string, to
 		Where("trade_id = ?", tradeID).
 		Where("status = ?", mdb.StatusWaitSelect).
 		Updates(map[string]interface{}{
-			"status":          mdb.StatusWaitPay,
-			"network":         mdb.PaymentProviderOkPay,
-			"token":           strings.ToUpper(strings.TrimSpace(token)),
-			"receive_address": "OKPAY",
-			"actual_amount":   actualAmount,
-			"is_selected":     false,
-			"pay_provider":    mdb.PaymentProviderOkPay,
-			"created_at":      gorm.Expr("CASE WHEN collection_mode = ? THEN created_at ELSE ? END", mdb.CollectionExclusive, time.Now()),
+			"status":             mdb.StatusWaitPay,
+			"network":            mdb.PaymentProviderOkPay,
+			"token":              strings.ToUpper(strings.TrimSpace(token)),
+			"receive_address":    "OKPAY",
+			"actual_amount":      actualAmount,
+			"is_selected":        false,
+			"pay_provider":       mdb.PaymentProviderOkPay,
+			"created_at":         gorm.Expr("CASE WHEN collection_mode = ? THEN created_at ELSE ? END", mdb.CollectionExclusive, time.Now()),
+			"payment_expires_at": gorm.Expr("CASE WHEN collection_mode = ? THEN payment_expires_at ELSE ? END", mdb.CollectionExclusive, time.Now().Add(config.GetOrderExpirationTimeDuration())),
 		})
 	return result.RowsAffected > 0, result.Error
 }
@@ -422,16 +583,13 @@ func CompleteWaitSelectOkPayOrderWithTransaction(tx *gorm.DB, tradeID string, to
 // as selected for a hosted payment provider. It intentionally does not fill
 // chain fields or create a transaction lock; the provider child order carries
 // the concrete payment target.
-func MarkProviderSwitchParentSelectedWithTransaction(tx *gorm.DB, tradeID string) (bool, error) {
-	result := tx.Model(&mdb.Orders{}).
-		Where("trade_id = ?", tradeID).
-		Where("status IN ?", []int{mdb.StatusWaitPay, mdb.StatusWaitSelect}).
-		Updates(map[string]interface{}{
-			"status":      mdb.StatusWaitPay,
-			"is_selected": true,
-			"created_at":  gorm.Expr("CASE WHEN collection_mode = ? THEN created_at ELSE ? END", mdb.CollectionExclusive, time.Now()),
-		})
-	return result.RowsAffected > 0, result.Error
+func MarkProviderSwitchParentSelectedWithTransaction(tx *gorm.DB, tradeID string) (updated bool, err error) {
+	err = tx.Transaction(func(tx *gorm.DB) error {
+		var updateErr error
+		updated, updateErr = refreshOrderExpirationTx(tx, tradeID, true)
+		return updateErr
+	})
+	return
 }
 
 // ExpireOrderByTradeID marks a waiting order as expired. Used to retire failed
@@ -441,17 +599,97 @@ func ExpireOrderByTradeID(tradeId string) error {
 		Where("trade_id = ?", tradeId).
 		Where("status = ?", mdb.StatusWaitPay).
 		Updates(map[string]interface{}{
-			"status":      mdb.StatusExpired,
-			"is_selected": false,
+			"status":         mdb.StatusExpired,
+			"closed_reason":  mdb.OrderClosedSuperseded,
+			"is_selected":    false,
+			"released_at_ms": time.Now().UnixMilli(),
 		}).Error
 }
 
 // RefreshOrderExpiration resets created_at to now so the expiration timer restarts.
 // Called on the parent order when a sub-order is created or returned.
-func RefreshOrderExpiration(tradeId string) error {
-	return dao.Mdb.Model(&mdb.Orders{}).
-		Where("trade_id = ? AND collection_mode <> ?", tradeId, mdb.CollectionExclusive).
-		Update("created_at", time.Now()).Error
+func RefreshOrderExpiration(tradeID string) error {
+	return dao.Mdb.Transaction(func(tx *gorm.DB) error {
+		return RefreshOrderExpirationWithTransaction(tx, tradeID)
+	})
+}
+
+// Keep child creation and the parent deadline in the same business transaction.
+func RefreshOrderExpirationWithTransaction(tx *gorm.DB, tradeID string) error {
+	_, err := refreshOrderExpirationTx(tx, tradeID, false)
+	return err
+}
+
+func refreshOrderExpirationTx(tx *gorm.DB, tradeID string, selected bool) (bool, error) {
+	var order mdb.Orders
+	if err := tx.Where("trade_id = ?", tradeID).First(&order).Error; err != nil {
+		return false, err
+	}
+	if order.Status != mdb.StatusWaitPay && order.Status != mdb.StatusWaitSelect {
+		return false, constant.OrderStatusConflict
+	}
+	updates := map[string]interface{}{}
+	if selected {
+		updates["status"], updates["is_selected"] = mdb.StatusWaitPay, true
+	}
+	if order.CollectionMode != mdb.CollectionExclusive {
+		now := time.Now()
+		if !PaymentDeadline(&order).After(now) {
+			return false, constant.OrderStatusConflict
+		}
+		deadline := now.Add(config.GetOrderExpirationTimeDuration())
+		if PaymentDeadline(&order).After(deadline) {
+			deadline = PaymentDeadline(&order)
+		}
+		if order.ReceiveAddress != "" && (order.PayProvider == "" || order.PayProvider == mdb.PaymentProviderOnChain) {
+			var lock mdb.TransactionLock
+			if err := dao.RuntimeDB.Where("trade_id = ?", tradeID).Find(&lock).Error; err != nil {
+				return false, err
+			}
+			if lock.ID == 0 || !lock.ExpiresAt.After(now) || lock.Network != normalizeLockNetwork(order.Network) ||
+				lock.Address != normalizeLockAddress(order.Network, order.ReceiveAddress) || lock.Token != normalizeLockToken(order.Token) || !lockMatchesAmount(lock, order.ActualAmount) {
+				return false, constant.OrderStatusConflict
+			}
+			// Runtime DB is separate: extend the reservation BEFORE publishing a
+			// later deadline. If the business commit fails, only extra reservation
+			// time remains; never release it early or resurrect an expired lock.
+			if lock.ExpiresAt.Before(deadline) {
+				result := dao.RuntimeDB.Model(&mdb.TransactionLock{}).Where("id = ? AND trade_id = ? AND expires_at > ?", lock.ID, tradeID, now).Update("expires_at", deadline)
+				if result.Error != nil {
+					return false, result.Error
+				}
+				if result.RowsAffected != 1 {
+					return false, constant.OrderStatusConflict
+				}
+			}
+		}
+		if err := freezeLegacyAssignment(tx, tradeID); err != nil {
+			return false, err
+		}
+		updates["created_at"], updates["payment_expires_at"] = now, deadline
+	}
+	if len(updates) == 0 {
+		return true, nil
+	}
+	result := tx.Model(&mdb.Orders{}).Where("id = ? AND status = ?", order.ID, order.Status).Updates(updates)
+	if result.Error != nil {
+		return false, result.Error
+	}
+	if result.RowsAffected != 1 {
+		return false, constant.OrderStatusConflict
+	}
+	return true, nil
+}
+
+// Legacy channel switches refresh created_at for the checkout timer. Preserve
+// the original address assignment first, so an earlier payment is still owned.
+func freezeLegacyAssignment(tx *gorm.DB, tradeID string) error {
+	var order mdb.Orders
+	err := tx.Where("trade_id = ? AND collection_mode <> ? AND assigned_at_ms = 0 AND status = ? AND receive_address <> '' AND (pay_provider = ? OR pay_provider = '')", tradeID, mdb.CollectionExclusive, mdb.StatusWaitPay, mdb.PaymentProviderOnChain).Find(&order).Error
+	if err != nil || order.ID == 0 {
+		return err
+	}
+	return tx.Model(&mdb.Orders{}).Where("id = ? AND assigned_at_ms = 0 AND status = ?", order.ID, mdb.StatusWaitPay).UpdateColumn("assigned_at_ms", order.CreatedAt.TimestampMilli()).Error
 }
 
 // ResetCallbackConfirmOk sets callback_confirm back to Ok.
@@ -503,7 +741,7 @@ func ExpireOrderByTradeId(tradeId string) error {
 	return dao.Mdb.Model(&mdb.Orders{}).
 		Where("trade_id = ?", tradeId).
 		Where("status = ?", mdb.StatusWaitPay).
-		Update("status", mdb.StatusExpired).Error
+		Updates(map[string]interface{}{"status": mdb.StatusExpired, "closed_reason": mdb.OrderClosedSuperseded, "released_at_ms": time.Now().UnixMilli()}).Error
 }
 
 // GetTradeIdByWalletAddressAndAmountAndToken resolves the reserved trade id by network, address, token and amount.

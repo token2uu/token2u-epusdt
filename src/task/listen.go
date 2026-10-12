@@ -4,6 +4,7 @@ import (
 	"fmt"
 
 	"github.com/GMWalletApp/epusdt/config"
+	"github.com/GMWalletApp/epusdt/model/mdb"
 	"github.com/GMWalletApp/epusdt/util/log"
 	"github.com/robfig/cron/v3"
 )
@@ -35,6 +36,12 @@ func Start() {
 	}
 
 	log.Sugar.Infof("[task] ListenSolJob scheduled successfully (%s)", solanaSchedule)
+	for _, network := range []string{mdb.NetworkSolana, mdb.NetworkAptos} {
+		if _, err := c.AddJob("@every 30s", &PaymentReviewJob{Network: network}); err != nil {
+			log.Sugar.Errorf("[task] Failed to add payment review: %v", err)
+			return
+		}
+	}
 
 	// RPC node health checks
 	_, err = c.AddJob("@every 30s", RpcHealthJob{})

@@ -92,7 +92,7 @@ func processExpiredOrders() {
 				Select("id", "trade_id", "status", "network", "receive_address", "token", "actual_amount", "pay_provider").
 				Where("status IN ?", []int{mdb.StatusWaitPay, mdb.StatusWaitSelect}).
 				Where("collection_mode <> ?", mdb.CollectionExclusive).
-				Where("created_at <= ?", expirationCutoff).
+				Where("(payment_expires_at IS NOT NULL AND payment_expires_at <= ?) OR (payment_expires_at IS NULL AND created_at <= ?)", time.Now(), expirationCutoff).
 				Order("id asc").
 				Limit(batchSize).
 				Find(&orders).Error
@@ -125,7 +125,9 @@ func processExpiredOrders() {
 			if strings.TrimSpace(order.Network) == "" || strings.TrimSpace(order.ReceiveAddress) == "" || strings.TrimSpace(order.Token) == "" || order.ActualAmount <= 0 {
 				continue
 			}
-			if err = data.UnLockTransaction(order.Network, order.ReceiveAddress, order.Token, order.ActualAmount); err != nil {
+			// Runtime locks may already have expired and been reassigned. Release
+			// only this order's lock, never the next owner's identical amount.
+			if err = data.UnLockTransactionByTradeId(order.TradeId); err != nil {
 				log.Sugar.Warnf("[mq] release expired transaction lock failed, trade_id=%s, err=%v", order.TradeId, err)
 			}
 		}

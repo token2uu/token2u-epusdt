@@ -390,6 +390,20 @@ func GetSolanaScanInterval() time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
+func PaymentReviewWindowSeconds() int {
+	if seconds := viper.GetInt("payment_review_window_seconds"); seconds > 0 {
+		return seconds
+	}
+	return 120
+}
+
+func PaymentReviewGraceSeconds() int {
+	if seconds := viper.GetInt("payment_review_grace_seconds"); seconds > 0 {
+		return seconds
+	}
+	return 600
+}
+
 func GetSolanaScanConcurrency() int {
 	concurrency := viper.GetInt("solana_scan_concurrency")
 	if concurrency <= 0 {

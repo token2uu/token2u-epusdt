@@ -135,6 +135,10 @@ func TestTryProcessEvmERC20TransferUsesChainTokenContract(t *testing.T) {
 	if err := dao.Mdb.Create(order).Error; err != nil {
 		t.Fatalf("seed order: %v", err)
 	}
+	// This test checks the asset contract, away from the allocation second.
+	if err := dao.Mdb.Model(order).Update("created_at", time.Now().Add(-time.Minute)).Error; err != nil {
+		t.Fatal(err)
+	}
 	if err := data.LockTransaction(mdb.NetworkEthereum, order.ReceiveAddress, order.Token, order.TradeId, order.ActualAmount, time.Hour); err != nil {
 		t.Fatalf("lock transaction: %v", err)
 	}
@@ -261,10 +265,10 @@ func TestTryProcessEvmERC20TransferRecoversExpiredOrderAfterLockCleanup(t *testi
 	if err := dao.Mdb.Create(order).Error; err != nil {
 		t.Fatalf("seed expired order: %v", err)
 	}
-	createdAt := time.Now().Add(-2 * time.Minute)
+	createdAt := time.Now().Add(-2 * config.GetOrderExpirationTimeDuration())
 	if err := dao.Mdb.Model(&mdb.Orders{}).
 		Where("trade_id = ?", tradeID).
-		Update("created_at", createdAt).Error; err != nil {
+		Updates(map[string]interface{}{"created_at": createdAt, "payment_expires_at": createdAt.Add(config.GetOrderExpirationTimeDuration()), "closed_reason": mdb.OrderClosedExpired}).Error; err != nil {
 		t.Fatalf("backdate order: %v", err)
 	}
 
@@ -323,7 +327,7 @@ func TestTryProcessEvmERC20TransferSkipsExpiredOrderAfterPaymentWindow(t *testin
 	createdAt := time.Now().Add(-2 * config.GetOrderExpirationTimeDuration())
 	if err := dao.Mdb.Model(&mdb.Orders{}).
 		Where("trade_id = ?", tradeID).
-		Update("created_at", createdAt).Error; err != nil {
+		Updates(map[string]interface{}{"created_at": createdAt, "payment_expires_at": createdAt.Add(config.GetOrderExpirationTimeDuration()), "closed_reason": mdb.OrderClosedExpired}).Error; err != nil {
 		t.Fatalf("backdate order: %v", err)
 	}
 

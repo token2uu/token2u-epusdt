@@ -259,7 +259,7 @@ func HandleOkPayNotify(form map[string]string, rawFormData string) error {
 		return fmt.Errorf("okpay amount mismatch: got=%.*f want=%.*f", precision, notifyAmount, precision, order.ActualAmount)
 	}
 
-	err = OrderProcessing(&request.OrderProcessingRequest{
+	err = orderProcessing(&request.OrderProcessingRequest{
 		ReceiveAddress:     order.ReceiveAddress,
 		Currency:           order.Currency,
 		Token:              order.Token,
@@ -267,6 +267,9 @@ func HandleOkPayNotify(form map[string]string, rawFormData string) error {
 		Amount:             order.ActualAmount,
 		TradeId:            order.TradeId,
 		BlockTransactionId: payload.OrderID,
+	}, orderProcessingOptions{
+		allowedStatuses: manualPaymentWaitPayStatuses, parentAllowedStatuses: manualPaymentWaitPayStatuses,
+		authenticatedProvider: true,
 	})
 	processed := err == nil
 	if err != nil && err != constant.OrderBlockAlreadyProcess {

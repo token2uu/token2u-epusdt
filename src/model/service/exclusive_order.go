@@ -9,7 +9,9 @@ import (
 	"github.com/GMWalletApp/epusdt/model/data"
 	"github.com/GMWalletApp/epusdt/model/mdb"
 	"github.com/GMWalletApp/epusdt/model/response"
+	addressutil "github.com/GMWalletApp/epusdt/util/address"
 	"github.com/GMWalletApp/epusdt/util/constant"
+	"github.com/GMWalletApp/epusdt/util/log"
 	"github.com/shopspring/decimal"
 )
 
@@ -113,15 +115,44 @@ func switchExclusiveNetwork(parent *mdb.Orders, token, network string) (*respons
 // migration. Retired exclusive slots remain reserved from the legacy allocator;
 // new exclusive orders may reuse them through the ownership-aware allocator.
 func addressHasExclusiveHistory(network, address, token string) (bool, error) {
+	key := normalizeOrderAddressByNetwork(network, address)
+	if network == mdb.NetworkTon {
+		var err error
+		key, err = addressutil.TonRawAddressKey(address)
+		if err != nil {
+			return false, err
+		}
+	}
 	var count int64
-	err := dao.Mdb.Model(&mdb.PaymentAddress{}).Where("network = ? AND address = ? AND token = ?", network, normalizeOrderAddressByNetwork(network, address), token).Count(&count).Error
+	err := dao.Mdb.Model(&mdb.PaymentAddress{}).Where("network = ? AND address = ? AND token = ?", network, key, token).Count(&count).Error
 	return count > 0, err
 }
 
 // The durable receipt decides whether this is a new settlement; replayed events
 // never emit another operator notification.
-func processExclusivePayment(p data.ObservedPayment) (bool, error) {
-	handled, settled, err := data.ProcessExclusivePaymentWithResult(p)
+func processObservedPayment(p data.ObservedPayment) (bool, error) {
+	handled, settled, err := data.SettleLegacyObservedPaymentWithResult(p)
+	if err == nil && settled != nil {
+		root := settled.TradeId
+		if settled.ParentTradeId != "" {
+			root = settled.ParentTradeId
+		}
+		group, loadErr := data.GetAllSubOrders(root)
+		if loadErr != nil {
+			log.Sugar.Warnf("[PAYMENT-RECOVERY] load reservations trade_id=%s: %v", root, loadErr)
+		}
+		group = append(group, *settled, mdb.Orders{TradeId: root})
+		for _, order := range group {
+			if unlockErr := data.UnLockTransactionByTradeId(order.TradeId); unlockErr != nil {
+				// Payment and callback state are already durable. Stale runtime
+				// reservations also have their own expiry/cleanup worker.
+				log.Sugar.Warnf("[PAYMENT-RECOVERY] release reservation trade_id=%s: %v", order.TradeId, unlockErr)
+			}
+		}
+	}
+	if err == nil && !handled {
+		handled, settled, err = data.ProcessExclusivePaymentWithResult(p)
+	}
 	if err == nil && settled != nil {
 		sendPaymentNotification(settled)
 	}

@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"fmt"
 	"strconv"
 	"strings"
@@ -11,8 +12,12 @@ import (
 )
 
 func solGetTransactionTransfers(signature string, watchedAddresses []string, tokens map[string]*mdb.ChainToken) ([]*TransferInfo, error) {
+	return solGetTransactionTransfersWithContext(context.Background(), signature, watchedAddresses, tokens)
+}
+
+func solGetTransactionTransfersWithContext(ctx context.Context, signature string, watchedAddresses []string, tokens map[string]*mdb.ChainToken) ([]*TransferInfo, error) {
 	var transfers []*TransferInfo
-	_, err := solRetryClientValidated("getTransaction", []interface{}{signature, map[string]interface{}{
+	_, err := solRetryClientValidatedWithContext(ctx, "getTransaction", []interface{}{signature, map[string]interface{}{
 		"encoding": "jsonParsed", "commitment": "finalized", "maxSupportedTransactionVersion": 0,
 	}}, func(body []byte) error {
 		result := gjson.GetBytes(body, "result")

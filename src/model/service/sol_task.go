@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math/big"
@@ -54,6 +55,16 @@ func SolCallBack(address string, wg *sync.WaitGroup) {
 // ScanSolanaAddress reports completion so one healthy wallet cannot hide a
 // failed wallet in the scheduler's overall scan-progress statistics.
 func ScanSolanaAddress(address string) (scanErr error) {
+	return ScanSolanaAddressWithContext(context.Background(), address)
+}
+
+func ScanSolanaAddressWithContext(ctx context.Context, address string) (scanErr error) {
+	if IsPaidPaymentReview(ctx) {
+		if _, loaded := solReviewsInFlight.LoadOrStore(address, struct{}{}); loaded {
+			return fmt.Errorf("Solana payment review already running for %s", address)
+		}
+		defer solReviewsInFlight.Delete(address)
+	}
 	scanErr = fmt.Errorf("Solana address scan incomplete")
 	defer func() {
 		if err := recover(); err != nil {
@@ -98,8 +109,6 @@ func ScanSolanaAddress(address string) (scanErr error) {
 		return true
 	})
 
-	limit := 1000
-
 	// 查询钱包地址 + 每个已启用 SPL 代币 ATA 的签名
 	queryAddrs := []string{address}
 	for mint := range mintTokens {
@@ -115,17 +124,13 @@ func ScanSolanaAddress(address string) (scanErr error) {
 	// cursors only after every fetched transaction is durably processed.
 	cutoffTime := time.Now().Add(-config.GetOrderExpirationTimeDuration() - 5*time.Minute).Unix()
 	initialBoundaryLoaded := false
-	type signatureQuery struct {
-		address, key, until string
-		cutoff              int64
-	}
-	queries := make([]signatureQuery, 0, len(queryAddrs))
-	seen := make(map[string]bool)
-	var result []solSignatureResult
-	nextCursors := make(map[string]string)
+	queries := make([]solSignatureQuery, 0, len(queryAddrs))
 	allProcessed := true
 	for _, queryAddr := range queryAddrs {
 		key := "solana:signatures:" + queryAddr
+		if IsPaidPaymentReview(ctx) {
+			key = "solana:payment_review:" + queryAddr
+		}
 		until, err := data.LoadPaymentCursor(key)
 		if err != nil {
 			log.Sugar.Errorf("[SOL] load cursor: %v", err)
@@ -164,56 +169,16 @@ func ScanSolanaAddress(address string) (scanErr error) {
 				}
 			}
 		}
-		queries = append(queries, signatureQuery{address: queryAddr, key: key, until: until, cutoff: queryCutoffTime})
+		queries = append(queries, solSignatureQuery{Address: queryAddr, Key: key, Until: until, Cutoff: queryCutoffTime})
 	}
-	// Freeze every owner/ATA boundary before requesting remote data, so an
-	// outage on the first query cannot age a later account's payment out.
-	for _, query := range queries {
-		queryAddr, key, until, queryCutoffTime := query.address, query.key, query.until, query.cutoff
-		before := ""
-		pageSignatures := make(map[string]bool)
-		for {
-			body, err := solGetSignaturesForAddressPage(queryAddr, limit, until, before, pageSignatures)
-			if err != nil {
-				var deferred *solanaHistoryBackoffError
-				if errors.As(err, &deferred) && deferred.cached {
-					log.Sugar.Debugf("[SOL] history query deferred owner=%s account=%s: %v", address, queryAddr, err)
-				} else {
-					log.Sugar.Errorf("[SOL] fetch signatures owner=%s account=%s: %v", address, queryAddr, err)
-				}
-				return
-			}
-			batch, err := parseSolSignatureList(body, limit)
-			if err != nil {
-				log.Sugar.Errorf("[SOL] invalid signature response: %v", err)
-				return
-			}
-			if len(batch) == 0 {
-				break
-			}
-			if before == "" {
-				nextCursors[key] = batch[0].Signature
-			}
-			reachedStart := false
-			for _, sig := range batch {
-				pageSignatures[sig.Signature] = true
-				if until == "" && sig.BlockTime != nil && *sig.BlockTime < queryCutoffTime {
-					reachedStart = true
-					continue
-				}
-				if !seen[sig.Signature] {
-					seen[sig.Signature] = true
-					result = append(result, sig)
-				}
-			}
-			// limit is an upper bound, not proof of an exhausted range. A
-			// provider may cap pages below it, so keep walking even short pages.
-			if reachedStart {
-				break
-			}
-			before = batch[len(batch)-1].Signature
-		}
+	// Paid scans checkpoint each page and transaction, so the next bounded
+	// round can resume even when the entire address history takes >12 seconds.
+	work, err := collectSolanaSignatures(ctx, address, queries)
+	if err != nil {
+		log.Sugar.Errorf("[SOL] collect signatures owner=%s: %v", address, err)
+		return
 	}
+	result := work.Signatures
 
 	if len(result) == 0 {
 		log.Sugar.Debugf("[SOL][%s] no transaction signatures found", address)
@@ -236,7 +201,13 @@ func ScanSolanaAddress(address string) (scanErr error) {
 
 	// Process each transaction signature
 	for sigIdx, txSig := range result {
+		if ctx.Err() != nil {
+			return
+		}
 		sig := txSig.Signature
+		if work.Processed[sig] {
+			continue
+		}
 		retrySignature := false
 
 		// Skip failed transactions
@@ -245,13 +216,13 @@ func ScanSolanaAddress(address string) (scanErr error) {
 		}
 
 		// 跳过已处理的签名
-		if _, ok := gProcessedSignatures.Load(address + ":" + sig); ok {
+		if _, ok := gProcessedSignatures.Load(address + ":" + sig); ok && !IsPaidPaymentReview(ctx) {
 			continue
 		}
 
 		log.Sugar.Debugf("[SOL][%s] [%d/%d] processing sig=%s slot=%d", address, sigIdx+1, len(result), sig, txSig.Slot)
 
-		transfers, err := solGetTransactionTransfers(sig, queryAddrs, mintTokens)
+		transfers, err := solGetTransactionTransfersWithContext(ctx, sig, queryAddrs, mintTokens)
 		if err != nil {
 			log.Sugar.Debugf("[SOL][%s] sig=%s fetch failed: %v", address, sig, err)
 			allProcessed = false
@@ -290,9 +261,10 @@ func ScanSolanaAddress(address string) (scanErr error) {
 			if transferInfo.Mint == "SOL" {
 				decimals = 9
 			}
-			handled, collectionErr := processExclusivePayment(data.ObservedPayment{Network: mdb.NetworkSolana, Address: address,
+			observed := data.ObservedPayment{Network: mdb.NetworkSolana, Address: address,
 				Token: symbol, AssetID: assetID, RawAmount: new(big.Int).SetUint64(transferInfo.RawAmount), Decimals: decimals,
-				TxHash: sig, EventID: fmt.Sprintf("instruction:%d", instrIdx), BlockTimeMs: transferInfo.BlockTime * 1000})
+				TxHash: sig, EventID: fmt.Sprintf("instruction:%d", instrIdx), BlockTimeMs: transferInfo.BlockTime * 1000}
+			handled, collectionErr := processObservedPayment(observed)
 			if collectionErr != nil {
 				retrySignature = true
 				log.Sugar.Errorf("[SOL] collection: %v", collectionErr)
@@ -317,6 +289,10 @@ func ScanSolanaAddress(address string) (scanErr error) {
 			}
 			tradeID := matchResult.TradeId
 			if tradeID == "" {
+				if _, err := processObservedPayment(observed); err != nil {
+					retrySignature = true
+					log.Sugar.Errorf("[SOL] reservation recovery: %v", err)
+				}
 				log.Sugar.Infof("[SOL][%s] sig=%s no active transaction_lock matched: network=solana address=%s token=%s amount=%.2f (no order or expired)",
 					address, sig, address, token, amount)
 				continue
@@ -334,17 +310,22 @@ func ScanSolanaAddress(address string) (scanErr error) {
 				retrySignature = true
 				continue
 			}
-			log.Sugar.Infof("[SOL][%s] order loaded: trade_id=%s order_id=%s status=%d created_at_ms=%d",
-				address, tradeID, order.OrderId, order.Status, order.CreatedAt.TimestampMilli())
+			log.Sugar.Infof("[SOL][%s] order loaded: trade_id=%s order_id=%s status=%d assigned_at_ms=%d",
+				address, tradeID, order.OrderId, order.Status, data.PaymentAssignmentTimeMs(order))
 
 			// blockTime 秒 → 毫秒，与订单创建时间对齐
 			blockTimestamp := transferInfo.BlockTime * 1000
-			createTime := order.CreatedAt.TimestampMilli()
-			log.Sugar.Infof("[SOL][%s] time check: sig=%s block_time_ms=%d order_created_ms=%d diff_ms=%d",
+			createTime := data.PaymentAssignmentTimeMs(order)
+			log.Sugar.Infof("[SOL][%s] time check: sig=%s block_time_ms=%d order_assigned_ms=%d diff_ms=%d",
 				address, sig, blockTimestamp, createTime, blockTimestamp-createTime)
 			if blockTimestamp < createTime {
-				log.Sugar.Warnf("[SOL][%s] sig=%s skipped: block_time_ms=%d is %d ms before order created_ms=%d (transaction predates the order)",
+				log.Sugar.Warnf("[SOL][%s] sig=%s skipped: block_time_ms=%d is %d ms before address assigned_ms=%d (transaction predates the order)",
 					address, sig, blockTimestamp, createTime-blockTimestamp, createTime)
+				continue
+			}
+
+			if blockTimestamp+999 >= data.PaymentDeadline(order).UnixMilli() {
+				log.Sugar.Warnf("[SOL] skip payment outside order deadline trade_id=%s sig=%s", tradeID, sig)
 				continue
 			}
 
@@ -363,7 +344,15 @@ func ScanSolanaAddress(address string) (scanErr error) {
 				address, tradeID, sig, token, amount)
 			err = processSolanaOrder(req)
 			if err != nil {
-				if errors.Is(err, constant.OrderBlockAlreadyProcess) || errors.Is(err, constant.OrderStatusConflict) {
+				if errors.Is(err, constant.OrderStatusConflict) {
+					handled, recoveryErr := processObservedPayment(observed)
+					if recoveryErr != nil || !handled {
+						retrySignature = true
+						log.Sugar.Errorf("[SOL] status conflict recovery: handled=%v err=%v", handled, recoveryErr)
+					}
+					continue
+				}
+				if errors.Is(err, constant.OrderBlockAlreadyProcess) {
 					log.Sugar.Infof("[SOL][%s] sig=%s already resolved: trade_id=%s reason=%v", address, sig, tradeID, err)
 					continue
 				}
@@ -386,11 +375,25 @@ func ScanSolanaAddress(address string) (scanErr error) {
 
 		// 标记已处理
 		gProcessedSignatures.Store(address+":"+sig, time.Now().Unix())
+		work.Processed[sig] = true
+		if err := work.save(ctx, address); err != nil {
+			log.Sugar.Errorf("[SOL] save review progress: %v", err)
+			return
+		}
 	}
 	if allProcessed {
-		for key, sig := range nextCursors {
-			if err := data.SavePaymentCursor(key, sig); err != nil {
+		for _, query := range work.Queries {
+			if query.Next == "" {
+				continue
+			}
+			if err := data.SavePaymentCursor(query.Key, query.Next); err != nil {
 				log.Sugar.Errorf("[SOL] save cursor: %v", err)
+				return
+			}
+		}
+		if IsPaidPaymentReview(ctx) {
+			if err := data.SavePaymentCursor(solReviewWorkKey(address), ""); err != nil {
+				log.Sugar.Errorf("[SOL] clear completed review: %v", err)
 				return
 			}
 		}
@@ -439,6 +442,10 @@ func SolRetryClient(method string, params []interface{}) (body []byte, err error
 
 // validate is read-only and runs before accepting each candidate response.
 func solRetryClientValidated(method string, params []interface{}, validate func([]byte) error) (body []byte, err error) {
+	return solRetryClientValidatedWithContext(context.Background(), method, params, validate)
+}
+
+func solRetryClientValidatedWithContext(ctx context.Context, method string, params []interface{}, validate func([]byte) error) (body []byte, err error) {
 	defer func() {
 		if err != nil {
 			data.RecordRpcFailure(mdb.NetworkSolana)
@@ -450,7 +457,10 @@ func solRetryClientValidated(method string, params []interface{}, validate func(
 	tried := make([]uint64, 0, 3)
 	var lastErr error
 	for attempts := 0; attempts < 3; attempts++ {
-		node, err := resolveSolanaRpcNode(tried...)
+		node, err := SelectRPCNode(ctx, mdb.NetworkSolana, mdb.RpcNodeTypeHttp, tried...)
+		if err == nil && node == nil {
+			err = fmt.Errorf("no enabled Solana RPC node")
+		}
 		if err != nil {
 			if lastErr != nil {
 				return nil, lastErr
@@ -461,8 +471,8 @@ func solRetryClientValidated(method string, params []interface{}, validate func(
 		if node.ApiKey != "" {
 			headers.Set("Authorization", "Bearer "+node.ApiKey)
 		}
-		body, err := solHistoryBackoff.do(node.Url, method, params, headers, func() ([]byte, error) {
-			return solRequestWithNode(*node, method, params, headers, RPCErrorReason(lastErr), true)
+		body, err := solHistoryBackoff.doContext(ctx, node.Url, method, params, headers, func() ([]byte, error) {
+			return solRequestWithNodeContext(ctx, *node, method, params, headers, RPCErrorReason(lastErr), true)
 		})
 		if err == nil && validate != nil {
 			if validationErr := validate(body); validationErr != nil {
@@ -479,6 +489,9 @@ func solRetryClientValidated(method string, params []interface{}, validate func(
 		}
 
 		lastErr = err
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		if RPCErrorReason(err) == "local_capacity" {
 			tried = append(tried, node.ID)
 			continue
@@ -530,6 +543,10 @@ func solRequestWithURLHeaders(rpcUrl string, method string, params []interface{}
 }
 
 func solRequestWithNode(node mdb.RpcNode, method string, params []interface{}, headers http.Header, reason string, failover bool) ([]byte, error) {
+	return solRequestWithNodeContext(context.Background(), node, method, params, headers, reason, failover)
+}
+
+func solRequestWithNodeContext(ctx context.Context, node mdb.RpcNode, method string, params []interface{}, headers http.Header, reason string, failover bool) ([]byte, error) {
 	rpcUrl := node.Url
 	// Direct/manual callers pass authorization in headers; use the same identity
 	// as automatic calls for both transport and Solana-specific cooldowns.
@@ -564,7 +581,7 @@ func solRequestWithNode(node mdb.RpcNode, method string, params []interface{}, h
 		return nil
 	})
 
-	req := client.R().SetHeader("Content-Type", "application/json")
+	req := client.R().SetContext(ctx).SetHeader("Content-Type", "application/json")
 	if node.ApiKey != "" {
 		req.SetHeader("Authorization", "Bearer "+node.ApiKey)
 	}
@@ -618,6 +635,10 @@ func SolGetSignaturesForAddress(address string, limit int, untilSig string, befo
 // account's walk. Validation is read-only so a rejected endpoint can be retried
 // against another endpoint without contaminating pagination state.
 func solGetSignaturesForAddressPage(address string, limit int, untilSig string, beforeSig string, previous map[string]bool) ([]byte, error) {
+	return solGetSignaturesForAddressPageWithContext(context.Background(), address, limit, untilSig, beforeSig, previous)
+}
+
+func solGetSignaturesForAddressPageWithContext(ctx context.Context, address string, limit int, untilSig string, beforeSig string, previous map[string]bool) ([]byte, error) {
 	opts := map[string]interface{}{
 		"commitment": "finalized",
 		"limit":      limit,
@@ -629,7 +650,7 @@ func solGetSignaturesForAddressPage(address string, limit int, untilSig string, 
 		opts["before"] = beforeSig
 	}
 
-	return solRetryClientValidated("getSignaturesForAddress", []interface{}{address, opts}, func(body []byte) error {
+	return solRetryClientValidatedWithContext(ctx, "getSignaturesForAddress", []interface{}{address, opts}, func(body []byte) error {
 		batch, err := parseSolSignatureList(body, limit)
 		if err != nil {
 			return err

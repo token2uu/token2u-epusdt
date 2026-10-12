@@ -14,9 +14,9 @@ import (
 	"github.com/GMWalletApp/epusdt/model/dao"
 	"github.com/GMWalletApp/epusdt/model/data"
 	"github.com/GMWalletApp/epusdt/model/mdb"
-	"github.com/GMWalletApp/epusdt/model/request"
 	"github.com/spf13/viper"
 	"github.com/tidwall/gjson"
+	"gorm.io/gorm"
 )
 
 func setupSolanaRPCNode(t *testing.T, url string) func() {
@@ -471,18 +471,18 @@ func TestSolCallBackDoesNotCacheSignatureAfterRetryableOrderProcessingError(t *t
 		t.Fatalf("lock transaction: %v", err)
 	}
 
-	oldProcessSolanaOrder := processSolanaOrder
 	calls := 0
-	processSolanaOrder = func(req *request.OrderProcessingRequest) error {
-		calls++
-		if req.TradeId != tradeID {
-			t.Fatalf("order processing trade_id = %q, want %q", req.TradeId, tradeID)
+	hook := "fail_sol_settlement"
+	if err := dao.Mdb.Callback().Update().Before("gorm:update").Register(hook, func(tx *gorm.DB) {
+		updates, ok := tx.Statement.Dest.(map[string]interface{})
+		if ok && tx.Statement.Table == "orders" && updates["status"] == mdb.StatusPaySuccess {
+			calls++
+			tx.AddError(errors.New("temporary database error"))
 		}
-		return errors.New("temporary database error")
+	}); err != nil {
+		t.Fatal(err)
 	}
-	t.Cleanup(func() {
-		processSolanaOrder = oldProcessSolanaOrder
-	})
+	defer dao.Mdb.Callback().Update().Remove(hook)
 
 	var wg sync.WaitGroup
 	wg.Add(1)

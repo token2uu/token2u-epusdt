@@ -2,6 +2,7 @@ package task
 
 import (
 	"bytes"
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -147,11 +148,15 @@ func doPost(url string, apiKey string, body interface{}) ([]byte, error) {
 }
 
 func doPostNode(node mdb.RpcNode, url string, body interface{}, reason string) ([]byte, time.Time, error) {
+	return doPostNodeWithContext(context.Background(), node, url, body, reason)
+}
+
+func doPostNodeWithContext(ctx context.Context, node mdb.RpcNode, url string, body interface{}, reason string) ([]byte, time.Time, error) {
 	data, marshalErr := json.Marshal(body)
 	if marshalErr != nil {
 		return nil, time.Time{}, marshalErr
 	}
-	req, err := http.NewRequest("POST", url, bytes.NewReader(data))
+	req, err := http.NewRequestWithContext(ctx, "POST", url, bytes.NewReader(data))
 	if err != nil {
 		return nil, time.Time{}, err
 	}
@@ -382,6 +387,7 @@ func processBlock(block *Block, tokenMap map[string]mdb.ChainToken) error {
 }
 
 type Scanner struct {
+	ctx       context.Context
 	baseURL   string
 	apiKey    string
 	nodeID    uint64
@@ -465,6 +471,21 @@ func (s *Scanner) Run() {
 }
 
 func (s *Scanner) poll() {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	orders, reviewErr := data.ListPaymentReviewOrders(mdb.NetworkTron, time.Now())
+	if reviewErr != nil {
+		log.Sugar.Warnf("[PAYMENT-REVIEW] load TRON orders: %v", reviewErr)
+	} else if len(orders) > 0 {
+		paidCtx := service.WithPaidPaymentReview(ctx)
+		if _, err := service.SelectRPCNode(paidCtx, mdb.NetworkTron, mdb.RpcNodeTypeHttp); err != nil {
+			log.Sugar.Warnf("[PAYMENT-REVIEW] TRON paid review unavailable: %v", err)
+		} else {
+			ctx = paidCtx
+		}
+	}
+	s.ctx = ctx
+	defer func() { s.ctx = nil }()
 	var scanErr error = fmt.Errorf("TRON scan incomplete")
 	defer func() { data.RecordRpcScanResult(mdb.NetworkTron, scanErr) }()
 	latest, err := s.fetchBlock(nil)
@@ -541,10 +562,45 @@ func (s *Scanner) poll() {
 // Resolve on every read so recovery returns traffic from a paid node to public
 // nodes. All attempts fetch the same block; only poll() commits the cursor.
 func (s *Scanner) fetchBlock(number *int64) (*Block, error) {
+	ctx := s.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	tried := []uint64{}
 	var lastErr error
+	// A paid deadline review augments the ordinary scanner. If paid sources
+	// fail, retry this same block through public-first routing in this round.
+	paidReview := service.IsPaidPaymentReview(ctx)
+	startedPaidReview := paidReview
+	selectNode := func() (*mdb.RpcNode, error) {
+		if startedPaidReview && !paidReview {
+			return data.SelectPublicFirstRpcNode(mdb.NetworkTron, mdb.RpcNodeTypeHttp, tried...)
+		}
+		return service.SelectRPCNode(ctx, mdb.NetworkTron, mdb.RpcNodeTypeHttp, tried...)
+	}
 	for attempt := 0; attempt < 3; attempt++ {
-		node, err := service.ResolveTronRpcNode(tried...)
+		if paidReview && attempt == 2 {
+			log.Sugar.Warn("[PAYMENT-REVIEW] TRON paid retry limit reached, continuing ordinary scan")
+			ctx = service.WithoutPaidPaymentReview(ctx)
+			s.ctx = ctx
+			paidReview = false
+		}
+		node, err := selectNode()
+		if err == nil && node == nil {
+			err = fmt.Errorf("no enabled TRON RPC node")
+		}
+		if err != nil {
+			if paidReview && ctx.Err() == nil {
+				log.Sugar.Warnf("[PAYMENT-REVIEW] TRON paid sources unavailable, continuing ordinary scan: %v", err)
+				ctx = service.WithoutPaidPaymentReview(ctx)
+				s.ctx = ctx
+				paidReview = false
+				node, err = selectNode()
+			}
+		}
+		if err == nil && node == nil {
+			err = fmt.Errorf("no available TRON RPC node")
+		}
 		if err != nil {
 			if lastErr != nil {
 				return nil, lastErr
@@ -557,7 +613,7 @@ func (s *Scanner) fetchBlock(number *int64) (*Block, error) {
 			path = "/wallet/getblockbynum"
 			body["num"] = *number
 		}
-		raw, requestStarted, err := doPostNode(*node, s.baseURL+path, body, service.RPCErrorReason(lastErr))
+		raw, requestStarted, err := doPostNodeWithContext(ctx, *node, s.baseURL+path, body, service.RPCErrorReason(lastErr))
 		var block Block
 		if err == nil {
 			err = validateTronBlockResponse(raw, number)
@@ -577,6 +633,9 @@ func (s *Scanner) fetchBlock(number *int64) (*Block, error) {
 			return &block, nil
 		}
 		lastErr = err
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		data.RecordRpcFailure(mdb.NetworkTron)
 		if service.RPCErrorReason(err) == "local_capacity" {
 			tried = append(tried, node.ID)

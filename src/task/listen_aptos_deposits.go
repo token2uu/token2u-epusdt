@@ -28,7 +28,7 @@ type aptosDepositProvider interface {
 	Transaction(int64, func([]byte) error) ([]byte, error)
 }
 
-type serviceAptosDepositProvider struct{}
+type serviceAptosDepositProvider struct{ ctx context.Context }
 
 func (serviceAptosDepositProvider) Head(ctx context.Context) (int64, error) {
 	return service.AptosIndexerHead(ctx)
@@ -36,7 +36,10 @@ func (serviceAptosDepositProvider) Head(ctx context.Context) (int64, error) {
 func (serviceAptosDepositProvider) Deposits(ctx context.Context, owner string, after service.AptosEventPosition, head int64, limit int, since string) ([]service.AptosIndexedDeposit, error) {
 	return service.AptosIndexerDepositsSince(ctx, owner, after, head, limit, since)
 }
-func (serviceAptosDepositProvider) Transaction(version int64, validate func([]byte) error) ([]byte, error) {
+func (p serviceAptosDepositProvider) Transaction(version int64, validate func([]byte) error) ([]byte, error) {
+	if p.ctx != nil {
+		return service.AptosGetTransactionByVersionWithContext(p.ctx, version, validate)
+	}
 	return service.AptosGetTransactionByVersionValidated(version, validate)
 }
 
@@ -106,7 +109,18 @@ func scanAptosDepositRound(ctx context.Context, provider aptosDepositProvider, s
 }
 
 func aptosDepositCursor(owner string) (service.AptosEventPosition, error) {
-	key := "aptos:deposits:" + owner
+	return aptosDepositCursorWithContext(context.Background(), owner)
+}
+
+func aptosDepositKey(ctx context.Context, owner string) string {
+	if service.IsPaidPaymentReview(ctx) {
+		return "aptos:payment_review:" + owner
+	}
+	return "aptos:deposits:" + owner
+}
+
+func aptosDepositCursorWithContext(ctx context.Context, owner string) (service.AptosEventPosition, error) {
+	key := aptosDepositKey(ctx, owner)
 	stored, err := data.LoadPaymentCursor(key)
 	if err != nil {
 		return service.AptosEventPosition{}, err
@@ -126,6 +140,9 @@ func aptosDepositCursor(owner string) (service.AptosEventPosition, error) {
 	legacy, err := data.LoadPaymentCursor("aptos:ledger")
 	if err != nil {
 		return service.AptosEventPosition{}, err
+	}
+	if service.IsPaidPaymentReview(ctx) {
+		legacy = ""
 	}
 	version := int64(-1)
 	if legacy != "" {
@@ -150,27 +167,48 @@ func aptosDepositCursor(owner string) (service.AptosEventPosition, error) {
 		}
 	}
 	cursor := service.AptosEventPosition{Version: version, Index: math.MaxInt64}
-	return cursor, saveAptosDepositCursor(owner, cursor)
+	return cursor, saveAptosDepositCursorWithContext(ctx, owner, cursor)
 }
 
 func saveAptosDepositCursor(owner string, cursor service.AptosEventPosition) error {
+	return saveAptosDepositCursorWithContext(context.Background(), owner, cursor)
+}
+
+func saveAptosDepositCursorWithContext(ctx context.Context, owner string, cursor service.AptosEventPosition) error {
 	encoded, err := json.Marshal(cursor)
 	if err != nil {
 		return err
 	}
-	return data.SavePaymentCursor("aptos:deposits:"+owner, string(encoded))
+	return data.SavePaymentCursor(aptosDepositKey(ctx, owner), string(encoded))
 }
 
 func scanAptosOwnerDeposits(ctx context.Context, provider aptosDepositProvider, owner string, tokens []mdb.ChainToken, head int64) error {
-	cursor, err := aptosDepositCursor(owner)
+	cursor, err := aptosDepositCursorWithContext(ctx, owner)
 	if err != nil {
 		return err
 	}
+	var work *aptosReviewWork
+	if service.IsPaidPaymentReview(ctx) {
+		work, err = loadAptosReviewWork(ctx, owner)
+		if err != nil {
+			return err
+		}
+		if work == nil {
+			work = &aptosReviewWork{Version: 1, Head: head}
+			if err := saveAptosReviewWork(ctx, owner, work); err != nil {
+				return err
+			}
+		}
+		head = work.Head
+	}
 	end := service.AptosEventPosition{Version: head, Index: math.MaxInt64}
 	if !end.After(cursor) { // An indexer rollback/lag must never rewind progress.
+		if work != nil {
+			return clearAptosReviewWork(ctx, owner)
+		}
 		return nil
 	}
-	since, err := data.LoadPaymentCursor("aptos:deposits:" + owner + ":start_time")
+	since, err := data.LoadPaymentCursor(aptosDepositKey(ctx, owner) + ":start_time")
 	if err != nil {
 		return err
 	}
@@ -179,37 +217,83 @@ func scanAptosOwnerDeposits(ctx context.Context, provider aptosDepositProvider, 
 			return fmt.Errorf("invalid Aptos scan start time")
 		}
 	}
-	verified := make(map[int64]bool)
 	for page := 0; page < aptosDepositPagesPerRound; page++ {
-		rows, err := provider.Deposits(ctx, owner, cursor, head, aptosDepositPageSize, since)
-		if err != nil {
+		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := validateAptosDepositPage(rows, owner, cursor, head); err != nil {
-			return err
-		}
-		// A service-side row cap can return fewer rows than requested even
-		// when more remain. Only a successful empty page proves exhaustion.
-		if len(rows) == 0 {
-			return saveAptosDepositCursor(owner, end)
-		}
-		for _, row := range rows {
-			pos, _ := row.Position() // Validated for the entire page above.
-			if verified[pos.Version] || !configuredAptosDeposit(row, tokens) {
-				continue
+		var rows []service.AptosIndexedDeposit
+		if work != nil && work.PageReady {
+			if work.After.After(cursor) {
+				return fmt.Errorf("Aptos review checkpoint is ahead of committed cursor")
 			}
-			// Only matching deposits fetch transaction evidence. Settlement keeps
-			// the same receipt keys for retries and legacy scanner overlap.
-			if err := verifyAptosIndexedTransaction(provider, owner, pos.Version, rows, tokens); err != nil {
+			rows = work.Rows
+		} else {
+			rows, err = provider.Deposits(ctx, owner, cursor, head, aptosDepositPageSize, since)
+			if err != nil {
 				return err
 			}
-			verified[pos.Version] = true
+			if err := validateAptosDepositPage(rows, owner, cursor, head); err != nil {
+				return err
+			}
+			if work != nil {
+				work.PageReady, work.After, work.Rows = true, cursor, rows
+				if err := saveAptosReviewWork(ctx, owner, work); err != nil {
+					return err
+				}
+			}
 		}
-		next, _ := rows[len(rows)-1].Position()
-		if err := saveAptosDepositCursor(owner, next); err != nil {
-			return err
+		// A short page is not exhaustion; only a successful empty page is.
+		if len(rows) == 0 {
+			if err := saveAptosDepositCursorWithContext(ctx, owner, end); err != nil {
+				return err
+			}
+			if work != nil {
+				return clearAptosReviewWork(ctx, owner)
+			}
+			return nil
 		}
-		cursor = next
+		for first := 0; first < len(rows); {
+			pos, _ := rows[first].Position() // Complete page was validated first.
+			last := first + 1
+			for last < len(rows) {
+				next, _ := rows[last].Position()
+				if next.Version != pos.Version {
+					break
+				}
+				last++
+			}
+			endOfGroup, _ := rows[last-1].Position()
+			if endOfGroup.After(cursor) {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				pending := make([]service.AptosIndexedDeposit, 0, last-first)
+				for _, row := range rows[first:last] {
+					position, _ := row.Position()
+					if position.After(cursor) && configuredAptosDeposit(row, tokens) {
+						pending = append(pending, row)
+					}
+				}
+				if len(pending) > 0 {
+					if err := verifyAptosIndexedTransaction(provider, owner, pos.Version, pending, tokens); err != nil {
+						return err
+					}
+				}
+				// Commit only the last verified event on this page, not the entire
+				// version: another page can contain more events from the same tx.
+				if err := saveAptosDepositCursorWithContext(ctx, owner, endOfGroup); err != nil {
+					return err
+				}
+				cursor = endOfGroup
+			}
+			first = last
+		}
+		if work != nil {
+			work.PageReady, work.Rows = false, nil
+			if err := saveAptosReviewWork(ctx, owner, work); err != nil {
+				return err
+			}
+		}
 	}
 	return nil // The next round resumes the exact event, including within a tx.
 }

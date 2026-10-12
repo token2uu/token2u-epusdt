@@ -9,6 +9,7 @@ import (
 	"github.com/GMWalletApp/epusdt/config"
 	"github.com/GMWalletApp/epusdt/model/mdb"
 	"github.com/gookit/color"
+	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
 
@@ -55,6 +56,10 @@ func MdbTableInit() {
 			}
 		}
 
+		if err := freezePendingPaymentDeadlines(); err != nil {
+			color.Red.Printf("[store_db] snapshot payment deadlines err=%s\n", err)
+			return
+		}
 		seedChains()
 		backfillRpcNodePurpose()
 		seedRpcNodes()
@@ -325,4 +330,20 @@ func SyncTelegramChannelFromSettings() {
 	} else {
 		color.Green.Printf("[store_db] created telegram notification_channel from settings (id=%d)\n", ch.ID)
 	}
+}
+
+// Only pending pre-upgrade rows can inherit the startup expiration setting.
+// Closed rows have unknown provenance and must never be labelled natural expiry.
+func freezePendingPaymentDeadlines() error {
+	var orders []mdb.Orders
+	duration := config.GetOrderExpirationTimeDuration()
+	return Mdb.Where("payment_expires_at IS NULL AND status IN ?", []int{mdb.StatusWaitPay, mdb.StatusWaitSelect}).FindInBatches(&orders, 200, func(tx *gorm.DB, batch int) error {
+		for _, order := range orders {
+			deadline := order.CreatedAt.StdTime().Add(duration)
+			if err := tx.Model(&mdb.Orders{}).Where("id = ? AND payment_expires_at IS NULL AND status IN ?", order.ID, []int{mdb.StatusWaitPay, mdb.StatusWaitSelect}).UpdateColumn("payment_expires_at", deadline).Error; err != nil {
+				return err
+			}
+		}
+		return nil
+	}).Error
 }

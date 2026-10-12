@@ -16,7 +16,8 @@ import (
 	"github.com/GMWalletApp/epusdt/util/log"
 )
 
-var gProcessedMoveTx sync.Map // transfer-level key -> unix timestamp
+var gProcessedMoveTx sync.Map  // transfer-level key -> unix timestamp
+var gProcessingMoveTx sync.Map // in-flight transfers are never acknowledged as processed
 
 var processMoveOrder = OrderProcessing
 
@@ -36,21 +37,30 @@ type MoveObservedTransfer struct {
 }
 
 func ProcessMoveObservedTransferResult(transfer MoveObservedTransfer) error {
-	handled, collectionErr := processExclusivePayment(data.ObservedPayment{Network: transfer.Network, Address: transfer.ReceiveAddress,
+	cacheKey := MoveTransferCacheKey(transfer)
+	if _, loaded := gProcessingMoveTx.LoadOrStore(cacheKey, struct{}{}); loaded {
+		return fmt.Errorf("Move transfer %s is still being processed", cacheKey)
+	}
+	defer gProcessingMoveTx.Delete(cacheKey)
+	observed := data.ObservedPayment{Network: transfer.Network, Address: transfer.ReceiveAddress,
 		Token: transfer.Token, AssetID: transfer.AssetID, RawAmount: transfer.RawAmount, Decimals: transfer.Decimals,
-		TxHash: transfer.TxID, EventID: MoveTransferCacheKey(transfer), BlockTimeMs: transfer.BlockTimeMs})
+		TxHash: transfer.TxID, EventID: cacheKey, BlockTimeMs: transfer.BlockTimeMs}
+	handled, collectionErr := processObservedPayment(observed)
 	if collectionErr != nil || handled {
 		return collectionErr
 	}
-	net := moveLogLabel(transfer.Network)
-	cacheKey := MoveTransferCacheKey(transfer)
-	now := time.Now().Unix()
-	if _, loaded := gProcessedMoveTx.LoadOrStore(cacheKey, now); loaded {
+	if _, loaded := gProcessedMoveTx.Load(cacheKey); loaded {
 		return nil
 	}
-	clearCache := func() {
-		gProcessedMoveTx.Delete(cacheKey)
+	err := processLegacyMoveObservedTransfer(transfer, observed)
+	if err == nil {
+		gProcessedMoveTx.Store(cacheKey, time.Now().Unix())
 	}
+	return err
+}
+
+func processLegacyMoveObservedTransfer(transfer MoveObservedTransfer, observed data.ObservedPayment) error {
+	net := moveLogLabel(transfer.Network)
 	if transfer.RawAmount == nil || transfer.RawAmount.Sign() <= 0 || transfer.Amount <= 0 {
 		return nil
 	}
@@ -61,12 +71,14 @@ func ProcessMoveObservedTransferResult(transfer MoveObservedTransfer) error {
 
 	matchResult, err := data.GetTradeIdByWalletAddressAndAmountAndTokenWithEpayFallback(transfer.Network, transfer.ReceiveAddress, transfer.Token, transfer.Amount)
 	if err != nil {
-		clearCache()
 		log.Sugar.Errorf("[%s-%s][%s] lock lookup failed tx=%s: %v", net, transfer.Token, transfer.ReceiveAddress, transfer.TxID, err)
 		return err
 	}
 	tradeID := matchResult.TradeId
 	if tradeID == "" {
+		if _, err := processObservedPayment(observed); err != nil {
+			return err
+		}
 		raw := ""
 		if transfer.RawAmount != nil {
 			raw = transfer.RawAmount.String()
@@ -79,13 +91,19 @@ func ProcessMoveObservedTransferResult(transfer MoveObservedTransfer) error {
 	}
 	order, err := data.GetOrderInfoByTradeId(tradeID)
 	if err != nil {
-		clearCache()
 		log.Sugar.Errorf("[%s-%s][%s] load order trade_id=%s tx=%s: %v", net, transfer.Token, transfer.ReceiveAddress, tradeID, transfer.TxID, err)
 		return err
 	}
-	if err := EnsureMoveTransferMatchesOrder(order, transfer); err != nil {
-		log.Sugar.Warnf("[%s-%s][%s] skip tx=%s trade_id=%s: %v", net, transfer.Token, transfer.ReceiveAddress, transfer.TxID, tradeID, err)
+	if transfer.BlockTimeMs >= data.PaymentDeadline(order).UnixMilli() {
+		log.Sugar.Warnf("[%s] skip payment outside order deadline trade_id=%s tx=%s", net, tradeID, transfer.TxID)
 		return nil
+	}
+	if err := EnsureMoveTransferMatchesOrder(order, transfer); err != nil {
+		var mismatch *AmountMismatchError
+		if !matchResult.IsEpayFallback || !errors.As(err, &mismatch) {
+			log.Sugar.Warnf("[%s-%s][%s] skip tx=%s trade_id=%s: %v", net, transfer.Token, transfer.ReceiveAddress, transfer.TxID, tradeID, err)
+			return nil
+		}
 	}
 	req := &request.OrderProcessingRequest{
 		ReceiveAddress:     transfer.ReceiveAddress,
@@ -99,11 +117,20 @@ func ProcessMoveObservedTransferResult(transfer MoveObservedTransfer) error {
 		req.PaidAmount = transfer.Amount
 	}
 	if err = processMoveOrder(req); err != nil {
-		if errors.Is(err, constant.OrderBlockAlreadyProcess) || errors.Is(err, constant.OrderStatusConflict) {
+		if errors.Is(err, constant.OrderStatusConflict) {
+			handled, recoveryErr := processObservedPayment(observed)
+			if recoveryErr != nil || !handled {
+				if recoveryErr != nil {
+					return recoveryErr
+				}
+				return err
+			}
+			return nil
+		}
+		if errors.Is(err, constant.OrderBlockAlreadyProcess) {
 			log.Sugar.Infof("[%s-%s][%s] already resolved trade_id=%s tx=%s reason=%v", net, transfer.Token, transfer.ReceiveAddress, tradeID, transfer.TxID, err)
 			return nil
 		}
-		clearCache()
 		log.Sugar.Errorf("[%s-%s][%s] OrderProcessing failed trade_id=%s tx=%s: %v", net, transfer.Token, transfer.ReceiveAddress, tradeID, transfer.TxID, err)
 		return err
 	}
@@ -154,7 +181,7 @@ func EnsureMoveTransferMatchesOrder(order *mdb.Orders, transfer MoveObservedTran
 	if transfer.BlockTimeMs <= 0 {
 		return fmt.Errorf("transaction block time missing")
 	}
-	if transfer.BlockTimeMs < order.CreatedAt.TimestampMilli() {
+	if transfer.BlockTimeMs < data.PaymentAssignmentTimeMs(order) {
 		return fmt.Errorf("transaction predates the order")
 	}
 	if !amountMatchesRaw(order.ActualAmount, transfer.RawAmount, transfer.Decimals) {

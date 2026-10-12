@@ -100,6 +100,16 @@ func ListGeneralRpcCandidates(network, nodeType string) ([]mdb.RpcNode, error) {
 }
 
 func SelectGeneralRpcNode(network, nodeType string, excludeIDs ...uint64) (*mdb.RpcNode, error) {
+	return selectGeneralRpcNode(network, nodeType, true, excludeIDs...)
+}
+
+// SelectPublicFirstRpcNode starts ordinary routing after paid review attempts.
+// Excluded paid nodes must not trigger the ordinary third-attempt paid reserve.
+func SelectPublicFirstRpcNode(network, nodeType string, excludeIDs ...uint64) (*mdb.RpcNode, error) {
+	return selectGeneralRpcNode(network, nodeType, false, excludeIDs...)
+}
+
+func selectGeneralRpcNode(network, nodeType string, reservePaid bool, excludeIDs ...uint64) (*mdb.RpcNode, error) {
 	rows, err := ListGeneralRpcCandidates(network, nodeType)
 	if err != nil {
 		return nil, err
@@ -116,7 +126,7 @@ func SelectGeneralRpcNode(network, nodeType string, excludeIDs ...uint64) (*mdb.
 	}
 	// Reserve the third attempt for a paid fallback even if more public nodes
 	// exist. Weight only orders nodes within their cost/health group.
-	if len(excluded) >= 2 {
+	if reservePaid && len(excluded) >= 2 {
 		for i := range rows {
 			if rows[i].Purpose != mdb.RpcNodePurposePaidFallback || RpcEndpointCoolingDown(rows[i]) {
 				continue

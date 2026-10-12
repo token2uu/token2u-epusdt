@@ -96,3 +96,115 @@ func TestExclusiveCallbackRetriesActualAmountAndClosesLatePayment(t *testing.T) 
 		t.Fatal("late payment revived closed order")
 	}
 }
+
+func TestRecoveredPaymentCorrectsInflightCloseAndRetriesIdempotently(t *testing.T) {
+	defer testutil.SetupTestDatabases(t)()
+	callbackLimiter = make(chan struct{}, 1)
+	callbackInflight = sync.Map{}
+	defer waitForCallbackWorkers(t)
+	closedStarted, releaseClosed := make(chan struct{}), make(chan struct{})
+	var unblock sync.Once
+	release := func() { unblock.Do(func() { close(releaseClosed) }) }
+	defer release()
+	requests := make(chan url.Values, 8)
+	paidAttempts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		requests <- q
+		if q.Get("trade_status") == "TRADE_CLOSED" {
+			close(closedStarted)
+			select {
+			case <-releaseClosed:
+			case <-time.After(3 * time.Second):
+			}
+		} else {
+			paidAttempts++
+			if paidAttempts == 1 {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
+			}
+		}
+		_, _ = io.WriteString(w, "success")
+	}))
+	defer server.Close()
+	expires := time.Now().Add(time.Minute)
+	order := &mdb.Orders{TradeId: "recovered-callback", OrderId: "merchant-original", Network: "tron", Token: "USDT", Amount: 35, ActualAmount: 5, Currency: "CNY", Status: mdb.StatusWaitPay, PaymentType: mdb.PaymentTypeEpay, PaymentExpiresAt: &expires, NotifyUrl: server.URL, ApiKeyID: 2}
+	if err := data.CreateExclusivePayment(order, mdb.ChainToken{ContractAddress: "usdt", Decimals: 6}, []mdb.WalletAddress{{Address: "wallet"}}, false); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	if err := dao.Mdb.Model(order).Updates(map[string]interface{}{"assigned_at_ms": now.Add(-3 * time.Minute).UnixMilli(), "payment_expires_at": now.Add(-time.Minute)}).Error; err != nil {
+		t.Fatal(err)
+	}
+	processExpiredOrders()
+	dispatchPendingCallbacks()
+	select {
+	case <-closedStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("close callback did not start")
+	}
+	p := data.ObservedPayment{Network: "tron", Address: "wallet", Token: "USDT", AssetID: "usdt", TxHash: "paid-before-expiry", EventID: "0", RawAmount: big.NewInt(3_000_000), Decimals: 6, BlockTimeMs: now.Add(-2 * time.Minute).UnixMilli()}
+	if handled, err := data.ProcessExclusivePayment(p); !handled || err != nil {
+		t.Fatalf("recovery handled=%v err=%v", handled, err)
+	}
+	release()
+	waitForCallbackWorkers(t)
+	current, _ := data.GetOrderInfoByTradeId(order.TradeId)
+	if current.Status != mdb.StatusPaySuccess || current.CallBackConfirm != mdb.CallBackConfirmNo || current.CallbackNum != 0 {
+		t.Fatalf("stale close acknowledgement consumed success callback: %+v", current)
+	}
+	dispatchPendingCallbacks()
+	waitFor(t, 3*time.Second, func() bool { got, _ := data.GetOrderInfoByTradeId(order.TradeId); return got.CallbackNum == 1 })
+	waitForCallbackWorkers(t)
+	if err := dao.Mdb.Model(order).UpdateColumn("updated_at", time.Now().Add(-2*time.Second)).Error; err != nil {
+		t.Fatal(err)
+	}
+	dispatchPendingCallbacks()
+	waitForCallbackWorkers(t)
+	current, _ = data.GetOrderInfoByTradeId(order.TradeId)
+	if current.CallBackConfirm != mdb.CallBackConfirmOk || current.CallbackNum != 2 || current.PaidAmount != 21 {
+		t.Fatalf("success retry failed: %+v", current)
+	}
+	for i := 0; i < 3; i++ {
+		q := <-requests
+		if q.Get("trade_no") != order.TradeId || q.Get("out_trade_no") != order.OrderId {
+			t.Fatalf("callback changed original identity: %v", q)
+		}
+		if i > 0 && (q.Get("trade_status") != "TRADE_SUCCESS" || q.Get("paid_money") != "21.0000") {
+			t.Fatalf("incorrect corrected callback: %v", q)
+		}
+	}
+	if _, err := data.ProcessExclusivePayment(p); err != nil {
+		t.Fatal(err)
+	}
+	dispatchPendingCallbacks()
+	waitForCallbackWorkers(t)
+	current, _ = data.GetOrderInfoByTradeId(order.TradeId)
+	if current.CallbackNum != 2 || current.CallBackConfirm != mdb.CallBackConfirmOk || len(requests) != 0 {
+		t.Fatal("receipt replay requeued acknowledged callback")
+	}
+}
+
+func TestExpirationDoesNotReleaseReassignedLegacyAmount(t *testing.T) {
+	defer testutil.SetupTestDatabases(t)()
+	old := &mdb.Orders{TradeId: "old-reservation", OrderId: "old-reservation", Network: "tron", Token: "USDT", ReceiveAddress: "wallet", Status: mdb.StatusWaitPay, ActualAmount: 5}
+	if err := dao.Mdb.Create(old).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := dao.Mdb.Model(old).UpdateColumn("created_at", time.Now().Add(-time.Hour)).Error; err != nil {
+		t.Fatal(err)
+	}
+	// The runtime lock has already expired independently of the order queue.
+	// A new order now owns the same network/address/token/amount reservation.
+	if err := data.LockTransaction("tron", "wallet", "USDT", "new-reservation", 5, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	processExpiredOrders()
+	current, _ := data.GetOrderInfoByTradeId(old.TradeId)
+	if current.Status != mdb.StatusExpired || current.ReleasedAtMs == 0 {
+		t.Fatalf("original order not expired: %+v", current)
+	}
+	if id, err := data.GetTradeIdByWalletAddressAndAmountAndToken("tron", "wallet", "USDT", 5); err != nil || id != "new-reservation" {
+		t.Fatalf("expired order released new owner's lock: %s %v", id, err)
+	}
+}

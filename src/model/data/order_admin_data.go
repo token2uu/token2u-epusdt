@@ -113,6 +113,8 @@ func CloseOrderManually(tradeID string) (bool, error) {
 		Where("status IN ?", []int{mdb.StatusWaitPay, mdb.StatusWaitSelect}).
 		Updates(map[string]interface{}{
 			"status":           mdb.StatusExpired,
+			"closed_reason":    mdb.OrderClosedManual,
+			"released_at_ms":   time.Now().UnixMilli(),
 			"callback_confirm": mdb.CallBackConfirmOk,
 		})
 	return result.RowsAffected > 0, result.Error

@@ -1,15 +1,12 @@
 package task
 
 import (
-	"context"
-	"math/big"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/GMWalletApp/epusdt/model/data"
 	"github.com/GMWalletApp/epusdt/model/mdb"
-	"github.com/GMWalletApp/epusdt/model/service"
 	"github.com/GMWalletApp/epusdt/util/log"
 
 	"github.com/ethereum/go-ethereum"
@@ -82,35 +79,7 @@ func runPolygonListener(contracts []common.Address) {
 	}
 
 	runEvmWsLogListener(ctx, mdb.NetworkPolygon, "[POLYGON-WS]", wsNode, query, func(client *ethclient.Client, vLog types.Log) {
-		if len(vLog.Topics) < 3 {
-			return
-		}
-
-		event := vLog.Topics[0].String()
-		if event != transferEventHash.String() {
-			return
-		}
-
-		amount := new(big.Int).SetBytes(vLog.Data)
-
-		toAddr := common.HexToAddress(vLog.Topics[2].Hex())
-
-		if !isWatchedPolygonRecipient(toAddr) {
-			return
-		}
-
-		var blockTsMs int64
-		header, err := client.HeaderByNumber(context.Background(), big.NewInt(int64(vLog.BlockNumber)))
-		if err != nil {
-			data.RecordRpcFailure(mdb.NetworkPolygon)
-			log.Sugar.Warnf("[POLYGON-WS] HeaderByNumber block=%d: %v, using local time", vLog.BlockNumber, err)
-			blockTsMs = time.Now().UnixMilli()
-		} else {
-			data.RecordRpcSuccess(mdb.NetworkPolygon)
-			blockTsMs = int64(header.Time) * 1000
-		}
-
-		service.TryProcessEvmERC20Transfer(mdb.NetworkPolygon, vLog.Address, toAddr, amount, vLog.TxHash.Hex(), blockTsMs, vLog.Index)
+		processEvmWsTransfer(ctx, client, mdb.NetworkPolygon, "[POLYGON-WS]", vLog, isWatchedPolygonRecipient)
 	})
 }
 

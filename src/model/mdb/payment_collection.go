@@ -43,7 +43,9 @@ type PaymentReceipt struct {
 }
 
 type PaymentScanCursor struct {
-	Key       string `gorm:"size:256;primaryKey"`
-	Position  string `gorm:"size:256"`
+	Key string `gorm:"size:256;primaryKey"`
+	// Includes resumable scan checkpoints as well as short cursor positions.
+	// Unbounded strings map to TEXT (SQLite/Postgres) or LONGTEXT (MySQL).
+	Position  string
 	UpdatedAt time.Time
 }

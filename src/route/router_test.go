@@ -68,9 +68,6 @@ func setupTestEnv(t *testing.T) *echo.Echo {
 	if err := dao.DBInit(); err != nil {
 		t.Fatalf("DBInit: %v", err)
 	}
-	if err := dao.RuntimeInit(); err != nil {
-		t.Fatalf("RuntimeInit: %v", err)
-	}
 
 	// ensure tables exist (MdbTableInit uses sync.Once, so migrate directly)
 	dao.Mdb.AutoMigrate(
@@ -87,6 +84,10 @@ func setupTestEnv(t *testing.T) *echo.Echo {
 		&mdb.RpcNode{},
 		&mdb.ProviderOrder{},
 	)
+	// Production migrates the business schema before runtime reconciliation.
+	if err := dao.RuntimeInit(); err != nil {
+		t.Fatalf("RuntimeInit: %v", err)
+	}
 
 	// reset the settings cache so stale entries from a prior test don't leak
 	_ = data.ReloadSettings()
@@ -2431,12 +2432,14 @@ func TestCheckoutCounterResp_ReturnsExpiredOrder(t *testing.T) {
 	e := setupTestEnv(t)
 	tradeID := createCheckoutCounterRespTestOrder(t, e, "checkout-counter-expired-001")
 	expiredCreatedAt := carbon.Now().SubMinutes(config.GetOrderExpirationTime() + 1)
+	expiredDeadline := expiredCreatedAt.StdTime().Add(config.GetOrderExpirationTimeDuration())
 
 	if err := dao.Mdb.Model(&mdb.Orders{}).
 		Where("trade_id = ?", tradeID).
 		Updates(map[string]interface{}{
-			"status":     mdb.StatusExpired,
-			"created_at": expiredCreatedAt,
+			"status":             mdb.StatusExpired,
+			"created_at":         expiredCreatedAt,
+			"payment_expires_at": expiredDeadline,
 		}).Error; err != nil {
 		t.Fatalf("mark order expired: %v", err)
 	}

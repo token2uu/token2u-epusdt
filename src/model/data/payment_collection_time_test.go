@@ -123,14 +123,18 @@ func TestExclusiveLateScanDoesNotCreditReassignedWallet(t *testing.T) {
 			paidAt := base
 			wantReason, wantTrade := "ambiguous_chain_time", ""
 			if network == mdb.NetworkTron || network == mdb.NetworkAptos {
-				paidAt, wantReason, wantTrade = base+100, "closed_order", old.TradeId
+				paidAt, wantReason, wantTrade = base+100, "", old.TradeId
 			}
 			r := timedCollectionReceipt(t, current, paidAt)
 			assertTimedCollectionState(t, current, false)
-			if got := reloadCollection(t, old.TradeId); got.Status != mdb.StatusExpired || got.PaidAmount != 0 {
-				t.Fatalf("old order reopened: %+v", got)
+			wantStatus, wantPaid, wantReceipt := mdb.StatusExpired, float64(0), "exception"
+			if network == mdb.NetworkTron || network == mdb.NetworkAptos {
+				wantStatus, wantPaid, wantReceipt = mdb.StatusPaySuccess, 21, "settled"
 			}
-			if r.Status != "exception" || r.Reason != wantReason || r.TradeID != wantTrade {
+			if got := reloadCollection(t, old.TradeId); got.Status != wantStatus || got.PaidAmount != wantPaid {
+				t.Fatalf("wrong historical settlement: %+v", got)
+			}
+			if r.Status != wantReceipt || r.Reason != wantReason || r.TradeID != wantTrade {
 				t.Fatalf("wrong historical attribution: %+v", r)
 			}
 		})
@@ -145,7 +149,7 @@ func TestExclusiveSecondPrecisionExpirationBoundary(t *testing.T) {
 	}{
 		{"expires_inside_payment_second", 500, "ambiguous_chain_time"},
 		{"expires_at_payment_second_start", 0, "late_payment"},
-		{"whole_payment_second_before_expiry", 1000, "closed_order"},
+		{"whole_payment_second_before_expiry", 1000, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			defer testutil.SetupTestDatabases(t)()
@@ -155,11 +159,15 @@ func TestExclusiveSecondPrecisionExpirationBoundary(t *testing.T) {
 				t.Fatal(err)
 			}
 			r := timedCollectionReceipt(t, o, base)
-			if r.Status != "exception" || r.Reason != tc.wantReason || r.TradeID != o.TradeId {
+			wantReceipt, wantStatus, wantPaid := "exception", mdb.StatusExpired, float64(0)
+			if tc.wantReason == "" {
+				wantReceipt, wantStatus, wantPaid = "settled", mdb.StatusPaySuccess, 21
+			}
+			if r.Status != wantReceipt || r.Reason != tc.wantReason || r.TradeID != o.TradeId {
 				t.Fatalf("wrong expiry-boundary receipt: %+v", r)
 			}
-			if got := reloadCollection(t, o.TradeId); got.Status != mdb.StatusExpired || got.PaidAmount != 0 {
-				t.Fatalf("expired payment settled: %+v", got)
+			if got := reloadCollection(t, o.TradeId); got.Status != wantStatus || got.PaidAmount != wantPaid {
+				t.Fatalf("wrong historical payment state: %+v", got)
 			}
 		})
 	}

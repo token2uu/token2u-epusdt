@@ -7,7 +7,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/GMWalletApp/epusdt/config"
 	"github.com/GMWalletApp/epusdt/model/dao"
 	"github.com/GMWalletApp/epusdt/model/data"
 	"github.com/GMWalletApp/epusdt/model/mdb"
@@ -103,8 +102,12 @@ func processLegacyTronTRC20Transfer(token mdb.ChainToken, toAddr string, rawValu
 		log.Sugar.Warnf("[TRC20-%s][%s] skip trade_id=%s token mismatch order=%s", tokenSym, addr, tradeID, order.Token)
 		return
 	}
-	if blockTsMs > 0 && blockTsMs < order.CreatedAt.TimestampMilli() {
-		log.Sugar.Warnf("[TRC20-%s][%s] skip tx %s because block time %d is before order create time %d", tokenSym, addr, txHash, blockTsMs, order.CreatedAt.TimestampMilli())
+	if blockTsMs > 0 && blockTsMs >= data.PaymentDeadline(order).UnixMilli() {
+		log.Sugar.Warnf("[TRON] skip payment outside order deadline trade_id=%s hash=%s", tradeID, txHash)
+		return
+	}
+	if blockTsMs > 0 && blockTsMs < data.PaymentAssignmentTimeMs(order) {
+		log.Sugar.Warnf("[TRC20-%s][%s] skip tx %s because block time %d is before address assignment time %d", tokenSym, addr, txHash, blockTsMs, data.PaymentAssignmentTimeMs(order))
 		return
 	}
 
@@ -170,8 +173,12 @@ func processLegacyTronTRXTransfer(toAddr string, rawSun int64, txHash string, bl
 		log.Sugar.Warnf("[TRX][%s] load order: %v", addr, err)
 		return
 	}
-	if blockTsMs > 0 && blockTsMs < order.CreatedAt.TimestampMilli() {
-		log.Sugar.Warnf("[TRX][%s] skip tx %s because block time %d is before order create time %d", addr, txHash, blockTsMs, order.CreatedAt.TimestampMilli())
+	if blockTsMs > 0 && blockTsMs >= data.PaymentDeadline(order).UnixMilli() {
+		log.Sugar.Warnf("[TRON] skip payment outside order deadline trade_id=%s hash=%s", tradeID, txHash)
+		return
+	}
+	if blockTsMs > 0 && blockTsMs < data.PaymentAssignmentTimeMs(order) {
+		log.Sugar.Warnf("[TRX][%s] skip tx %s because block time %d is before address assignment time %d", addr, txHash, blockTsMs, data.PaymentAssignmentTimeMs(order))
 		return
 	}
 
@@ -216,6 +223,9 @@ func evmChainLogLabel(chainNetwork string) string {
 }
 
 func ProcessConfirmedEvmERC20Transfer(chainNetwork string, contract common.Address, toAddr common.Address, rawValue *big.Int, txHash string, blockTsMs int64, eventIndex uint) error {
+	if blockTsMs <= 0 {
+		return fmt.Errorf("missing EVM payment block time")
+	}
 	tokenConfig, err := data.GetEnabledChainTokenByContract(chainNetwork, contract.Hex())
 	if err != nil {
 		return err
@@ -223,7 +233,7 @@ func ProcessConfirmedEvmERC20Transfer(chainNetwork string, contract common.Addre
 	if tokenConfig == nil || tokenConfig.ID == 0 {
 		return nil
 	}
-	handled, err := processExclusivePayment(data.ObservedPayment{Network: chainNetwork, Address: toAddr.Hex(), Token: tokenConfig.Symbol, AssetID: contract.Hex(), RawAmount: rawValue, Decimals: tokenConfig.Decimals, TxHash: txHash, EventID: fmt.Sprintf("log:%d", eventIndex), BlockTimeMs: blockTsMs})
+	handled, err := processObservedPayment(data.ObservedPayment{Network: chainNetwork, Address: toAddr.Hex(), Token: tokenConfig.Symbol, AssetID: contract.Hex(), RawAmount: rawValue, Decimals: tokenConfig.Decimals, TxHash: txHash, EventID: fmt.Sprintf("log:%d", eventIndex), BlockTimeMs: blockTsMs})
 	if err != nil || handled {
 		return err
 	}
@@ -232,6 +242,11 @@ func ProcessConfirmedEvmERC20Transfer(chainNetwork string, contract common.Addre
 }
 
 func TryProcessEvmERC20Transfer(chainNetwork string, contract common.Address, toAddr common.Address, rawValue *big.Int, txHash string, blockTsMs int64, eventIndex ...uint) {
+	// Never fall through to current-lock matching without chain-time evidence.
+	if blockTsMs <= 0 {
+		log.Sugar.Warnf("[EVM] missing payment block time network=%s hash=%s; deferring to confirmed backfill", chainNetwork, txHash)
+		return
+	}
 	defer func() {
 		if err := recover(); err != nil {
 			log.Sugar.Errorf("[%s-WS] TryProcessEvmERC20Transfer panic: %v", evmChainLogLabel(chainNetwork), err)
@@ -285,6 +300,20 @@ func TryProcessEvmERC20Transfer(chainNetwork string, contract common.Address, to
 		return
 	}
 
+	if blockTsMs > 0 {
+		index := uint(0)
+		if len(eventIndex) > 0 {
+			index = eventIndex[0]
+		}
+		handled, err := processObservedPayment(data.ObservedPayment{Network: chainNetwork, Address: walletAddr, Token: tokenSym, AssetID: contract.Hex(), RawAmount: rawValue, Decimals: decimals, TxHash: txHash, EventID: fmt.Sprintf("log:%d", index), BlockTimeMs: blockTsMs})
+		if err != nil || handled {
+			if err != nil {
+				log.Sugar.Errorf("[%s-WS] observed payment: %v", net, err)
+			}
+			return
+		}
+	}
+
 	log.Sugar.Debugf("[%s-%s][%s] processing transfer hash=%s amount=%.2f", net, tokenSym, walletAddr, txHash, amount)
 
 	order, fromLock, isEpayFallback, err := resolveEvmTransferOrder(chainNetwork, walletAddr, tokenSym, amount, blockTsMs)
@@ -307,20 +336,17 @@ func TryProcessEvmERC20Transfer(chainNetwork string, contract common.Address, to
 		log.Sugar.Warnf("[%s-%s][%s] skip trade_id=%s token mismatch order=%s", net, tokenSym, walletAddr, order.TradeId, order.Token)
 		return
 	}
-	if blockTsMs > 0 && blockTsMs < order.CreatedAt.TimestampMilli() {
-		log.Sugar.Warnf("[%s-%s][%s] skip tx %s because block time %d is before order create time %d", net, tokenSym, walletAddr, txHash, blockTsMs, order.CreatedAt.TimestampMilli())
+	if blockTsMs > 0 && blockTsMs < data.PaymentAssignmentTimeMs(order) {
+		log.Sugar.Warnf("[%s-%s][%s] skip tx %s because block time %d is before address assignment time %d", net, tokenSym, walletAddr, txHash, blockTsMs, data.PaymentAssignmentTimeMs(order))
 		return
 	}
 
-	allowedStatuses := []int{mdb.StatusWaitPay}
-	if order.Status == mdb.StatusExpired {
-		expirationTs := order.CreatedAt.AddMinutes(config.GetOrderExpirationTime()).TimestampMilli()
-		if blockTsMs <= 0 || blockTsMs > expirationTs {
-			log.Sugar.Warnf("[%s-%s][%s] skip expired trade_id=%s because block time %d is after expiration %d", net, tokenSym, walletAddr, order.TradeId, blockTsMs, expirationTs)
-			return
-		}
-		allowedStatuses = []int{mdb.StatusWaitPay, mdb.StatusExpired}
+	// Naturally expired payments are handled by the receipt/ownership path
+	// above. The legacy fast path must never reopen closed or late orders.
+	if order.Status != mdb.StatusWaitPay || (blockTsMs > 0 && blockTsMs/1000*1000+999 >= data.PaymentDeadline(order).UnixMilli()) {
+		return
 	}
+	allowedStatuses := []int{mdb.StatusWaitPay}
 
 	if fromLock {
 		log.Sugar.Debugf("[%s-%s][%s] lock matched trade_id=%s", net, tokenSym, walletAddr, order.TradeId)
@@ -461,7 +487,7 @@ func networkDisplay(n string) string {
 
 // Result variants let block scanners retain their cursor on database failures.
 func ProcessTronTRC20Transfer(token mdb.ChainToken, to string, raw *big.Int, hash string, ts int64) error {
-	handled, err := processExclusivePayment(data.ObservedPayment{Network: mdb.NetworkTron, Address: to,
+	handled, err := processObservedPayment(data.ObservedPayment{Network: mdb.NetworkTron, Address: to,
 		Token: token.Symbol, AssetID: token.ContractAddress, RawAmount: raw, Decimals: token.Decimals,
 		TxHash: hash, EventID: "contract:0", BlockTimeMs: ts})
 	if err != nil || handled {
@@ -476,7 +502,7 @@ func TryProcessTronTRC20Transfer(token mdb.ChainToken, to string, raw *big.Int, 
 	}
 }
 func ProcessTronTRXTransfer(to string, raw int64, hash string, ts int64) error {
-	handled, err := processExclusivePayment(data.ObservedPayment{Network: mdb.NetworkTron, Address: to,
+	handled, err := processObservedPayment(data.ObservedPayment{Network: mdb.NetworkTron, Address: to,
 		Token: "TRX", AssetID: "", RawAmount: big.NewInt(raw), Decimals: 6, TxHash: hash, EventID: "contract:0", BlockTimeMs: ts})
 	if err != nil || handled {
 		return err

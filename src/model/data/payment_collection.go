@@ -191,6 +191,10 @@ func closeExclusiveTx(tx *gorm.DB, order mdb.Orders, now time.Time, notify bool)
 	if err := q.Find(&group).Error; err != nil {
 		return err
 	}
+	reason := mdb.OrderClosedManual
+	if notify {
+		reason = mdb.OrderClosedExpired
+	}
 	for _, item := range group {
 		if item.CollectionMode != mdb.CollectionExclusive {
 			continue
@@ -200,9 +204,14 @@ func closeExclusiveTx(tx *gorm.DB, order mdb.Orders, now time.Time, notify bool)
 			ack = mdb.CallBackConfirmNo
 		}
 		if err := tx.Model(&mdb.Orders{}).Where("id = ? AND status IN ?", item.ID, []int{mdb.StatusWaitPay, mdb.StatusWaitSelect}).Updates(map[string]interface{}{
-			"status": mdb.StatusExpired, "callback_confirm": ack, "callback_num": 0,
+			"status": mdb.StatusExpired, "closed_reason": reason, "callback_confirm": ack, "callback_num": 0,
 		}).Error; err != nil {
 			return err
+		}
+		if item.PayProvider != "" && item.PayProvider != mdb.PaymentProviderOnChain {
+			if err := tx.Model(&mdb.ProviderOrder{}).Where("trade_id = ? AND provider = ? AND status IN ?", item.TradeId, item.PayProvider, []string{mdb.ProviderOrderStatusCreating, mdb.ProviderOrderStatusPending}).Update("status", mdb.ProviderOrderStatusExpired).Error; err != nil {
+				return err
+			}
 		}
 		if err := releaseExclusiveTx(tx, item.TradeId, now); err != nil {
 			return err
@@ -286,7 +295,8 @@ func ProcessExclusivePaymentWithResult(p ObservedPayment) (handled bool, settled
 		}
 		if sameAsset == 0 && p.Token != "" {
 			var legacy int64
-			if err := tx.Model(&mdb.Orders{}).Where("network = ? AND receive_address = ? AND token = ? AND collection_mode <> ? AND status IN ?", p.Network, p.Address, p.Token, mdb.CollectionExclusive, []int{mdb.StatusWaitPay, mdb.StatusExpired}).Count(&legacy).Error; err != nil {
+			legacyQuery := tx.Model(&mdb.Orders{}).Where("network = ? AND token = ? AND collection_mode <> ? AND status IN ?", p.Network, p.Token, mdb.CollectionExclusive, []int{mdb.StatusWaitPay, mdb.StatusExpired})
+			if err := applyOrderReceiveAddressFilter(legacyQuery, p.Network, p.Address).Count(&legacy).Error; err != nil {
 				return err
 			}
 			if legacy > 0 {
@@ -295,12 +305,17 @@ func ProcessExclusivePaymentWithResult(p ObservedPayment) (handled bool, settled
 		}
 		handled = true
 		key := fmt.Sprintf("%x", sha256.Sum256([]byte(p.Network+"\x00"+p.TxHash+"\x00"+p.EventID)))
-		var count int64
-		if err := tx.Model(&mdb.PaymentReceipt{}).Where("event_key = ?", key).Count(&count).Error; err != nil {
+		var existing mdb.PaymentReceipt
+		if err := tx.Where("event_key = ?", key).Find(&existing).Error; err != nil {
 			return err
 		}
-		if count > 0 {
+		if existing.ID != 0 && (existing.Status != "exception" || existing.ResolvedAt != nil ||
+			(existing.Reason != "closed_order" && existing.Reason != "assignment_released" && existing.Reason != "parent_closed")) {
 			return nil
+		}
+		if existing.ID != 0 && (existing.RawAmount != p.RawAmount.String() || existing.BlockTimeMs != p.BlockTimeMs ||
+			existing.AssetID != p.AssetID || existing.Decimals != p.Decimals || existing.Address != p.Address) {
+			return fmt.Errorf("replayed payment evidence differs from historical receipt")
 		}
 		now := time.Now()
 		if err := expireExclusiveTx(tx, now); err != nil {
@@ -310,9 +325,17 @@ func ProcessExclusivePaymentWithResult(p ObservedPayment) (handled bool, settled
 		receipt := mdb.PaymentReceipt{EventKey: key, Network: p.Network, Address: p.Address, Token: p.Token, AssetID: p.AssetID,
 			TxHash: p.TxHash, EventID: p.EventID, RawAmount: p.RawAmount.String(), Decimals: p.Decimals, Amount: amount.String(),
 			BlockTimeMs: p.BlockTimeMs, Status: "exception", Reason: "unassigned"}
+		receipt.ID = existing.ID
+		persist := func() error {
+			if receipt.ID != 0 {
+				return tx.Model(&existing).Updates(map[string]interface{}{"status": receipt.Status, "reason": receipt.Reason,
+					"trade_id": receipt.TradeID, "parent_trade_id": receipt.ParentTradeID}).Error
+			}
+			return tx.Create(&receipt).Error
+		}
 		if p.BlockTimeMs <= 0 {
 			receipt.Reason = "missing_chain_time"
-			return tx.Create(&receipt).Error
+			return persist()
 		}
 		chainTimeStart, chainTimeEnd := p.BlockTimeMs, p.BlockTimeMs
 		if p.Network == mdb.NetworkSolana || p.Network == mdb.NetworkTon || isEVMNetwork(p.Network) {
@@ -330,7 +353,7 @@ func ProcessExclusivePaymentWithResult(p ObservedPayment) (handled bool, settled
 			Order("assigned_at_ms DESC, id DESC").First(&candidate)
 		if errors.Is(lookup.Error, gorm.ErrRecordNotFound) {
 			receipt.Reason = "asset_or_assignment_mismatch"
-			return tx.Create(&receipt).Error
+			return persist()
 		}
 		if lookup.Error != nil {
 			return lookup.Error
@@ -339,41 +362,41 @@ func ProcessExclusivePaymentWithResult(p ObservedPayment) (handled bool, settled
 			// Keep the receipt unassigned: it may predate this order or belong
 			// to a previous owner of the address. Do not fall back to that owner.
 			receipt.Reason = "ambiguous_chain_time"
-			return tx.Create(&receipt).Error
+			return persist()
 		}
 		order := &candidate
 		receipt.TradeID, receipt.ParentTradeID = order.TradeId, order.ParentTradeId
 		if p.AssetID != order.AssetID || p.Decimals != order.AssetDecimals {
 			receipt.Reason = "asset_mismatch"
-			return tx.Create(&receipt).Error
+			return persist()
 		}
 		minimum, _ := decimal.NewFromString(order.MinimumPayment)
 		if amount.LessThan(minimum) {
 			receipt.Reason = "below_minimum"
-			return tx.Create(&receipt).Error
+			return persist()
 		}
 		if order.PaymentExpiresAt == nil || chainTimeStart >= order.PaymentExpiresAt.UnixMilli() {
 			receipt.Reason = "late_payment"
-			return tx.Create(&receipt).Error
+			return persist()
 		}
 		if chainTimeEnd >= order.PaymentExpiresAt.UnixMilli() {
 			receipt.Reason = "ambiguous_chain_time"
-			return tx.Create(&receipt).Error
+			return persist()
 		}
-		if order.Status != mdb.StatusWaitPay {
+		if !canSettleObservedOrder(order) {
 			receipt.Reason = "duplicate_payment"
 			if order.Status == mdb.StatusExpired {
 				receipt.Reason = "closed_order"
 			}
-			return tx.Create(&receipt).Error
+			return persist()
 		}
 		var slot mdb.PaymentAddress
 		if err := tx.Where("network = ? AND address = ? AND asset_id = ?", p.Network, p.Address, p.AssetID).First(&slot).Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 			return err
 		}
-		if slot.TradeID != order.TradeId {
+		if order.Status == mdb.StatusWaitPay && slot.TradeID != order.TradeId {
 			receipt.Reason = "assignment_released"
-			return tx.Create(&receipt).Error
+			return persist()
 		}
 		root := order
 		if order.ParentTradeId != "" {
@@ -381,9 +404,9 @@ func ProcessExclusivePaymentWithResult(p ObservedPayment) (handled bool, settled
 			if err := tx.Where("trade_id = ?", order.ParentTradeId).First(root).Error; err != nil {
 				return err
 			}
-			if root.Status != mdb.StatusWaitPay {
+			if !canSettleObservedOrder(root) {
 				receipt.Reason = "parent_closed"
-				return tx.Create(&receipt).Error
+				return persist()
 			}
 		}
 		rate, err := decimal.NewFromString(order.FiatPerToken)
@@ -393,9 +416,9 @@ func ProcessExclusivePaymentWithResult(p ObservedPayment) (handled bool, settled
 		paid := amount.Mul(rate).Round(2)
 		if !paid.IsPositive() {
 			receipt.Reason = "below_settlement_precision"
-			return tx.Create(&receipt).Error
+			return persist()
 		}
-		if err := settleExclusiveTx(tx, order, root, paid, amount.String(), p.TxHash, now); err != nil {
+		if err := settleObservedPaymentTx(tx, order, root, paid, amount.String(), p.TxHash, now); err != nil {
 			return err
 		}
 		receipt.Status, receipt.Reason = "settled", ""
@@ -403,7 +426,7 @@ func ProcessExclusivePaymentWithResult(p ObservedPayment) (handled bool, settled
 		if err := tx.Where("id = ?", order.ID).First(settled).Error; err != nil {
 			return err
 		}
-		return tx.Create(&receipt).Error
+		return persist()
 	})
 	if err != nil {
 		settled = nil
@@ -414,21 +437,38 @@ func ProcessExclusivePaymentWithResult(p ObservedPayment) (handled bool, settled
 // settleExclusiveTx atomically selects the winning channel, closes siblings,
 // releases all owned addresses and queues the root callback via its DB state.
 func settleExclusiveTx(tx *gorm.DB, order, root *mdb.Orders, paid decimal.Decimal, cryptoAmount, txHash string, now time.Time) error {
+	if order.Status != mdb.StatusWaitPay || root.Status != mdb.StatusWaitPay {
+		return constant.OrderStatusConflict
+	}
+	return settleObservedPaymentTx(tx, order, root, paid, cryptoAmount, txHash, now)
+}
+
+// The caller has verified chain time and historical ownership. Compare both
+// observed statuses so a concurrent expiry/payment cannot silently win twice.
+func settleObservedPaymentTx(tx *gorm.DB, order, root *mdb.Orders, paid decimal.Decimal, cryptoAmount, txHash string, now time.Time) error {
 	paidFloat, _ := paid.Float64()
 	updates := map[string]interface{}{"status": mdb.StatusPaySuccess, "paid_amount": paidFloat, "paid_crypto_amount": cryptoAmount,
-		"block_transaction_id": txHash, "callback_confirm": mdb.CallBackConfirmNo, "callback_num": 0}
+		"block_transaction_id": txHash, "callback_confirm": mdb.CallBackConfirmNo, "callback_num": 0, "released_at_ms": now.UnixMilli(), "closed_reason": ""}
 	if root.TradeId != order.TradeId {
 		updates["callback_confirm"] = mdb.CallBackConfirmOk
 	}
-	if err := tx.Model(&mdb.Orders{}).Where("id = ? AND status = ?", order.ID, mdb.StatusWaitPay).Updates(updates).Error; err != nil {
-		return err
+	result := tx.Model(&mdb.Orders{}).Where("id = ? AND status = ?", order.ID, order.Status).Updates(updates)
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return constant.OrderStatusConflict
 	}
 	if root.TradeId != order.TradeId {
-		if err := tx.Model(&mdb.Orders{}).Where("id = ? AND status = ?", root.ID, mdb.StatusWaitPay).Updates(map[string]interface{}{
+		result := tx.Model(&mdb.Orders{}).Where("id = ? AND status = ?", root.ID, root.Status).Updates(map[string]interface{}{
 			"status": mdb.StatusPaySuccess, "paid_amount": paidFloat, "paid_crypto_amount": cryptoAmount, "callback_confirm": mdb.CallBackConfirmNo,
-			"callback_num": 0, "pay_by_sub_id": order.ID,
-		}).Error; err != nil {
-			return err
+			"callback_num": 0, "pay_by_sub_id": order.ID, "released_at_ms": now.UnixMilli(), "closed_reason": "",
+		})
+		if result.Error != nil {
+			return result.Error
+		}
+		if result.RowsAffected != 1 {
+			return constant.OrderStatusConflict
 		}
 	}
 	var group []mdb.Orders
@@ -437,7 +477,12 @@ func settleExclusiveTx(tx *gorm.DB, order, root *mdb.Orders, paid decimal.Decima
 	}
 	for _, item := range group {
 		if item.Status == mdb.StatusWaitPay || item.Status == mdb.StatusWaitSelect {
-			if err := tx.Model(&mdb.Orders{}).Where("id = ?", item.ID).Updates(map[string]interface{}{"status": mdb.StatusExpired, "callback_confirm": mdb.CallBackConfirmOk}).Error; err != nil {
+			if err := tx.Model(&mdb.Orders{}).Where("id = ?", item.ID).Updates(map[string]interface{}{"status": mdb.StatusExpired, "closed_reason": mdb.OrderClosedSuperseded, "callback_confirm": mdb.CallBackConfirmOk, "released_at_ms": now.UnixMilli()}).Error; err != nil {
+				return err
+			}
+		}
+		if item.TradeId != order.TradeId && item.PayProvider != "" && item.PayProvider != mdb.PaymentProviderOnChain {
+			if err := tx.Model(&mdb.ProviderOrder{}).Where("trade_id = ? AND provider = ? AND status IN ?", item.TradeId, item.PayProvider, []string{mdb.ProviderOrderStatusCreating, mdb.ProviderOrderStatusPending}).Update("status", mdb.ProviderOrderStatusExpired).Error; err != nil {
 				return err
 			}
 		}

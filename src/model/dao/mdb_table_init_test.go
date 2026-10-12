@@ -1,12 +1,15 @@
 package dao
 
 import (
+	"fmt"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/GMWalletApp/epusdt/config"
 	"github.com/GMWalletApp/epusdt/model/mdb"
+	"github.com/dromara/carbon/v2"
 	"github.com/libtnb/sqlite"
 	"github.com/spf13/viper"
 	"gorm.io/gorm"
@@ -414,4 +417,175 @@ func setupSeedTableTestDB(t *testing.T, models ...interface{}) *gorm.DB {
 		t.Fatalf("migrate seed table: %v", err)
 	}
 	return db
+}
+
+func TestPendingDeadlineMigrationIsBatchedAndNeverReclassifiesClosedOrders(t *testing.T) {
+	db := setupSeedTableTestDB(t, &mdb.Orders{})
+	Mdb = db
+	viper.Set("order_expiration_time", 10)
+	t.Cleanup(func() { viper.Set("order_expiration_time", nil) })
+	created := time.Now().Add(-2 * time.Minute).Truncate(time.Second)
+	var orders []mdb.Orders
+	for i := 0; i < 205; i++ {
+		order := mdb.Orders{TradeId: fmt.Sprintf("migration-%d", i), OrderId: fmt.Sprintf("migration-%d", i), Status: mdb.StatusWaitPay}
+		order.CreatedAt = *carbon.NewTime(carbon.CreateFromStdTime(created))
+		orders = append(orders, order)
+	}
+	closed := mdb.Orders{TradeId: "closed", OrderId: "closed", Status: mdb.StatusExpired}
+	orders = append(orders, closed)
+	explicit := mdb.Orders{TradeId: "explicit", OrderId: "explicit", Status: mdb.StatusWaitPay}
+	deadline := created.Add(7 * time.Minute)
+	explicit.PaymentExpiresAt = &deadline
+	orders = append(orders, explicit)
+	if err := db.Create(&orders).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := freezePendingPaymentDeadlines(); err != nil {
+		t.Fatal(err)
+	}
+	viper.Set("order_expiration_time", 1)
+	if err := freezePendingPaymentDeadlines(); err != nil {
+		t.Fatal(err)
+	}
+	var got []mdb.Orders
+	if err := db.Order("id").Find(&got).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, order := range got {
+		if order.TradeId == "closed" {
+			if order.PaymentExpiresAt != nil || order.ClosedReason != "" {
+				t.Fatal("closed history was reclassified")
+			}
+			continue
+		}
+		want := created.Add(10 * time.Minute)
+		if order.TradeId == "explicit" {
+			want = deadline
+		}
+		if order.PaymentExpiresAt == nil || !order.PaymentExpiresAt.Equal(want) {
+			t.Fatalf("deadline was missed or overwritten: %+v", order)
+		}
+	}
+}
+
+func TestLegacyPrecisionMigrationPreservesReservationEvidence(t *testing.T) {
+	db := setupSeedTableTestDB(t, &mdb.Orders{}, &mdb.TransactionLock{})
+	oldRuntime := RuntimeDB
+	Mdb, RuntimeDB = db, db
+	t.Cleanup(func() { RuntimeDB = oldRuntime })
+	for i := 0; i < 205; i++ {
+		id := fmt.Sprintf("precision-%d", i)
+		o := mdb.Orders{TradeId: id, OrderId: id, ActualAmount: 5.0001, Status: mdb.StatusExpired}
+		if err := db.Create(&o).Error; err != nil {
+			t.Fatal(err)
+		}
+		lock := mdb.TransactionLock{TradeId: id, Network: "tron", Address: id, Token: "USDT", AmountScaled: 50001, AmountPrecision: 4, ExpiresAt: time.Now().Add(-time.Minute)}
+		if err := db.Create(&lock).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := snapshotLegacyReservations(); err != nil {
+		t.Fatal(err)
+	}
+	// A subsequent startup cannot replace an existing snapshot, even if stale
+	// runtime data differs. Expired locks count as historical evidence too.
+	if err := db.Model(&mdb.TransactionLock{}).Where("1 = 1").Update("amount_precision", 2).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := snapshotLegacyReservations(); err != nil {
+		t.Fatal(err)
+	}
+	var count int64
+	if err := db.Model(&mdb.Orders{}).Where("amount_precision = 4").Count(&count).Error; err != nil || count != 205 {
+		t.Fatalf("snapshots=%d err=%v", count, err)
+	}
+}
+
+func TestLegacyReservationMigrationRestoresOriginalWindow(t *testing.T) {
+	db := setupSeedTableTestDB(t, &mdb.Orders{}, &mdb.TransactionLock{})
+	oldRuntime := RuntimeDB
+	Mdb, RuntimeDB = db, db
+	t.Cleanup(func() { RuntimeDB = oldRuntime })
+	now := time.Now().Truncate(time.Millisecond)
+	assigned, expires := now.Add(-11*time.Minute), now.Add(-time.Minute)
+	refreshed := mdb.Orders{TradeId: "refreshed-window", OrderId: "refreshed-window", Status: mdb.StatusWaitPay, Network: "tron", Token: "USDT", ReceiveAddress: "wallet", ActualAmount: 5}
+	refreshed.CreatedAt = *carbon.NewTime(carbon.CreateFromStdTime(now.Add(-2 * time.Minute)))
+	if err := db.Create(&refreshed).Error; err != nil {
+		t.Fatal(err)
+	}
+	lock := mdb.TransactionLock{TradeId: refreshed.TradeId, Network: "tron", Token: "USDT", Address: "wallet", AmountPrecision: 2, AmountScaled: 500, CreatedAt: assigned, ExpiresAt: expires}
+	if err := db.Create(&lock).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := freezePendingPaymentDeadlines(); err != nil {
+		t.Fatal(err)
+	}
+	if err := snapshotLegacyReservations(); err != nil {
+		t.Fatal(err)
+	}
+	var got mdb.Orders
+	if err := db.Where("trade_id = ?", refreshed.TradeId).First(&got).Error; err != nil {
+		t.Fatal(err)
+	}
+	if got.PaymentExpiresAt == nil || !got.PaymentExpiresAt.Equal(expires) || got.AssignedAtMs != assigned.UnixMilli() {
+		t.Fatalf("original reservation lost: %+v", got)
+	}
+	// Subsequent starts cannot extend the original deadline or rewrite assignment.
+	if err := db.Model(&lock).Updates(map[string]interface{}{"expires_at": now.Add(time.Hour), "created_at": now.Add(-time.Hour)}).Error; err != nil {
+		t.Fatal(err)
+	}
+	if err := snapshotLegacyReservations(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Where("trade_id = ?", refreshed.TradeId).First(&got).Error; err != nil {
+		t.Fatal(err)
+	}
+	if !got.PaymentExpiresAt.Equal(expires) || got.AssignedAtMs != assigned.UnixMilli() {
+		t.Fatal("restart rewrote frozen window")
+	}
+}
+
+func TestLegacyReservationMigrationDoesNotInventMissingEvidence(t *testing.T) {
+	db := setupSeedTableTestDB(t, &mdb.Orders{}, &mdb.TransactionLock{})
+	oldRuntime := RuntimeDB
+	Mdb, RuntimeDB = db, db
+	t.Cleanup(func() { RuntimeDB = oldRuntime })
+	now := time.Now()
+	for _, kind := range []string{"unknown", "snapshotted", "exclusive", "provider", "placeholder"} {
+		o := mdb.Orders{TradeId: kind, OrderId: kind, Network: "tron", Token: "USDT", ReceiveAddress: "wallet", Status: mdb.StatusWaitPay, PaymentExpiresAt: &now}
+		switch kind {
+		case "snapshotted":
+			p := 2
+			o.AmountPrecision = &p
+		case "exclusive":
+			o.CollectionMode = mdb.CollectionExclusive
+		case "provider":
+			o.PayProvider = mdb.PaymentProviderOkPay
+		case "placeholder":
+			o.Status = mdb.StatusWaitSelect
+			o.ReceiveAddress = ""
+		}
+		if err := db.Create(&o).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := snapshotLegacyReservations(); err != nil {
+		t.Fatal(err)
+	}
+	if err := snapshotLegacyReservations(); err != nil {
+		t.Fatal(err)
+	}
+	var got []mdb.Orders
+	if err := db.Find(&got).Error; err != nil {
+		t.Fatal(err)
+	}
+	for _, o := range got {
+		if o.TradeId == "unknown" {
+			if o.Status != mdb.StatusExpired || o.ClosedReason != mdb.OrderClosedReservationUnknown || o.ReleasedAtMs <= 0 {
+				t.Fatalf("unreserved old checkout remains payable: %+v", o)
+			}
+		} else if o.ClosedReason != "" || (o.Status != mdb.StatusWaitPay && o.TradeId != "placeholder") {
+			t.Fatalf("unrelated order changed: %+v", o)
+		}
+	}
 }

@@ -126,7 +126,7 @@ func ProcessTonTransfer(transfer *TonObservedTransfer) error {
 	if transfer == nil {
 		return nil
 	}
-	handled, err := processExclusivePayment(data.ObservedPayment{Network: mdb.NetworkTon, Address: transfer.ReceiveAddress, Token: transfer.Token.Symbol, AssetID: transfer.Token.ContractAddress, RawAmount: transfer.RawAmount, Decimals: transfer.Token.Decimals, TxHash: transfer.BlockID, EventID: fmt.Sprintf("inbound:%d", transfer.LT), BlockTimeMs: transfer.BlockTimeMs})
+	handled, err := processObservedPayment(data.ObservedPayment{Network: mdb.NetworkTon, Address: transfer.ReceiveAddress, Token: transfer.Token.Symbol, AssetID: transfer.Token.ContractAddress, RawAmount: transfer.RawAmount, Decimals: transfer.Token.Decimals, TxHash: transfer.BlockID, EventID: fmt.Sprintf("inbound:%d", transfer.LT), BlockTimeMs: transfer.BlockTimeMs})
 	if err != nil || handled {
 		return err
 	}
@@ -181,8 +181,12 @@ func processLegacyTonTransfer(transfer *TonObservedTransfer) {
 		log.Sugar.Warnf("[TON-%s][%s] skip trade_id=%s receive address mismatch order=%s", tokenSym, receive, tradeID, order.ReceiveAddress)
 		return
 	}
-	if transfer.BlockTimeMs > 0 && transfer.BlockTimeMs < order.CreatedAt.TimestampMilli() {
-		log.Sugar.Warnf("[TON-%s][%s] skip tx %s because block time %d is before order create time %d", tokenSym, receive, transfer.BlockID, transfer.BlockTimeMs, order.CreatedAt.TimestampMilli())
+	if transfer.BlockTimeMs > 0 && transfer.BlockTimeMs/1000*1000+999 >= data.PaymentDeadline(order).UnixMilli() {
+		log.Sugar.Warnf("[TON] skip payment outside order deadline trade_id=%s tx=%s", tradeID, transfer.BlockID)
+		return
+	}
+	if transfer.BlockTimeMs > 0 && transfer.BlockTimeMs < data.PaymentAssignmentTimeMs(order) {
+		log.Sugar.Warnf("[TON-%s][%s] skip tx %s because block time %d is before address assignment time %d", tokenSym, receive, transfer.BlockID, transfer.BlockTimeMs, data.PaymentAssignmentTimeMs(order))
 		return
 	}
 
@@ -275,7 +279,7 @@ func EnsureTonTransferMatchesOrder(order *mdb.Orders, transfer *TonObservedTrans
 	if !tonOrderAddressMatches(order.ReceiveAddress, transfer.ReceiveAddress) {
 		return fmt.Errorf("transaction recipient mismatch")
 	}
-	if transfer.BlockTimeMs <= 0 || transfer.BlockTimeMs < order.CreatedAt.TimestampMilli() {
+	if transfer.BlockTimeMs <= 0 || transfer.BlockTimeMs < data.PaymentAssignmentTimeMs(order) {
 		return fmt.Errorf("transaction predates the order")
 	}
 	if !amountMatchesRaw(order.ActualAmount, transfer.RawAmount, transfer.Token.Decimals) {

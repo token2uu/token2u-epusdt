@@ -2,6 +2,7 @@ package service
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -331,5 +332,50 @@ func TestSolMissingHistoryPreservesCursorAndSettlesAfterRecovery(t *testing.T) {
 			scanSolCursor()
 			assertSolCursorSettlement(t, order) // No duplicate settlement after replay.
 		})
+	}
+}
+
+func TestSolSharedRequestSurvivesLeaderCancellation(t *testing.T) {
+	gate := newSolanaHistoryBackoff()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	entered := make(chan struct{})
+	leader := make(chan error, 1)
+	go func() {
+		_, err := gate.doContext(ctx, "local", "getTransaction", nil, nil, func() ([]byte, error) { close(entered); <-ctx.Done(); return nil, ctx.Err() })
+		leader <- err
+	}()
+	<-entered
+	waiter := make(chan error, 1)
+	go func() {
+		body, err := gate.doContext(context.Background(), "local", "getTransaction", nil, nil, func() ([]byte, error) { return []byte("recovered"), nil })
+		if err == nil && string(body) != "recovered" {
+			err = errors.New("incorrect shared response")
+		}
+		waiter <- err
+	}()
+	time.Sleep(10 * time.Millisecond)
+	cancel()
+	if err := <-leader; !errors.Is(err, context.Canceled) {
+		t.Fatalf("leader cancellation: %v", err)
+	}
+	select {
+	case err := <-waiter:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("live waiter did not recover")
+	}
+}
+
+func TestSolRequestTimeoutStillReturnsForFailover(t *testing.T) {
+	gate := newSolanaHistoryBackoff()
+	var calls atomic.Int32
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err := gate.doContext(ctx, "local", "getTransaction", nil, nil, func() ([]byte, error) { calls.Add(1); return nil, context.DeadlineExceeded })
+	if !errors.Is(err, context.DeadlineExceeded) || calls.Load() != 1 {
+		t.Fatalf("HTTP timeout retried indefinitely inside shared gate: calls=%d err=%v", calls.Load(), err)
 	}
 }

@@ -14,14 +14,23 @@ import (
 // Persist this before requesting a remote head so outages cannot move it forward.
 func PaymentScanStartTime(network, address string, now time.Time) (time.Time, error) {
 	start := now.Add(-config.GetOrderExpirationTimeDuration() - 5*time.Minute)
-	var oldest mdb.Orders
-	err := dao.Mdb.Where("network = ? AND receive_address = ? AND status = ?", network, address, mdb.StatusWaitPay).
-		Order("created_at ASC").First(&oldest).Error
-	if err != nil && err != gorm.ErrRecordNotFound {
-		return time.Time{}, err
-	}
-	if err == nil && oldest.CreatedAt.StdTime().Before(start) {
-		start = oldest.CreatedAt.StdTime()
+	for _, spec := range []struct{ filter, order string }{
+		{"assigned_at_ms = 0", "created_at ASC"},
+		{"assigned_at_ms > 0", "assigned_at_ms ASC"},
+	} {
+		var oldest mdb.Orders
+		q := dao.Mdb.Where("network = ? AND (status = ? OR (status = ? AND updated_at >= ?))", network,
+			mdb.StatusWaitPay, mdb.StatusExpired, now.Add(-time.Duration(config.PaymentReviewGraceSeconds())*time.Second)).Where(spec.filter)
+		err := q.Where("receive_address = ?", address).Order(spec.order).First(&oldest).Error
+		if err != nil && err != gorm.ErrRecordNotFound {
+			return time.Time{}, err
+		}
+		if err == nil {
+			assigned := time.UnixMilli(PaymentAssignmentTimeMs(&oldest))
+			if assigned.Before(start) {
+				start = assigned
+			}
+		}
 	}
 	return start, nil
 }

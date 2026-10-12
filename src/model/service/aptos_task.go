@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -40,10 +41,14 @@ func AptosGetTransactionByVersion(version int64) ([]byte, error) {
 // accepting a node response, so incomplete evidence can use the next node.
 // validate must be read-only: it may run once for each attempted node.
 func AptosGetTransactionByVersionValidated(version int64, validate func([]byte) error) ([]byte, error) {
+	return AptosGetTransactionByVersionWithContext(context.Background(), version, validate)
+}
+
+func AptosGetTransactionByVersionWithContext(ctx context.Context, version int64, validate func([]byte) error) ([]byte, error) {
 	if version < 0 {
 		return nil, fmt.Errorf("invalid Aptos transaction version")
 	}
-	return aptosGetValidated(fmt.Sprintf("/v1/transactions/by_version/%d", version), func(body []byte) error {
+	return aptosGetValidatedWithContext(ctx, fmt.Sprintf("/v1/transactions/by_version/%d", version), func(body []byte) error {
 		tx := gjson.ParseBytes(body)
 		if !gjson.ValidBytes(body) || !tx.IsObject() || tx.Get("version").String() != strconv.FormatInt(version, 10) || tx.Get("type").String() != "user_transaction" || tx.Get("success").Type != gjson.True {
 			return &RPCRequestError{Reason: "invalid_response"}
@@ -437,13 +442,20 @@ func aptosGet(path string) (body []byte, err error) {
 }
 
 func aptosGetValidated(path string, validate func([]byte) error) (body []byte, err error) {
+	return aptosGetValidatedWithContext(context.Background(), path, validate)
+}
+
+func aptosGetValidatedWithContext(ctx context.Context, path string, validate func([]byte) error) (body []byte, err error) {
 	network := mdb.NetworkAptos
 	defer recordMoveRPCResult(network, &err)
 
 	tried := make([]uint64, 0, 3)
 	var lastErr error
 	for attempts := 0; attempts < 3; attempts++ {
-		node, resolveErr := resolveAptosRpcNode(tried...)
+		node, resolveErr := SelectRPCNode(ctx, mdb.NetworkAptos, mdb.RpcNodeTypeHttp, tried...)
+		if resolveErr == nil && node == nil {
+			resolveErr = fmt.Errorf("no enabled Aptos RPC node")
+		}
 		if resolveErr != nil {
 			if lastErr != nil {
 				return nil, lastErr
@@ -454,7 +466,7 @@ func aptosGetValidated(path string, validate func([]byte) error) (body []byte, e
 			log.Sugar.Warnf("[APTOS] trying alternate RPC node path=%s node=%s", path, data.RpcNodeLogLabel(*node))
 		}
 
-		body, err = aptosGetWithNodeReason(*node, path, RPCErrorReason(lastErr))
+		body, err = aptosGetWithNodeContext(ctx, *node, path, RPCErrorReason(lastErr))
 		if err == nil && validate != nil {
 			err = validate(body)
 		}
@@ -464,6 +476,9 @@ func aptosGetValidated(path string, validate func([]byte) error) (body []byte, e
 		}
 
 		lastErr = err
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
 		if RPCErrorReason(err) == "local_capacity" {
 			tried = append(tried, node.ID)
 			continue
@@ -504,11 +519,15 @@ func aptosGetWithNode(node mdb.RpcNode, path string) (body []byte, err error) {
 }
 
 func aptosGetWithNodeReason(node mdb.RpcNode, path, reason string) (body []byte, err error) {
+	return aptosGetWithNodeContext(context.Background(), node, path, reason)
+}
+
+func aptosGetWithNodeContext(ctx context.Context, node mdb.RpcNode, path, reason string) (body []byte, err error) {
 	endpoint, err := aptosJoinURL(node.Url, path)
 	if err != nil {
 		return nil, err
 	}
-	req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
 		return nil, err
 	}

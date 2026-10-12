@@ -1,15 +1,12 @@
 package task
 
 import (
-	"context"
-	"math/big"
 	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/GMWalletApp/epusdt/model/data"
 	"github.com/GMWalletApp/epusdt/model/mdb"
-	"github.com/GMWalletApp/epusdt/model/service"
 	"github.com/GMWalletApp/epusdt/util/log"
 
 	"github.com/ethereum/go-ethereum"
@@ -83,35 +80,7 @@ func runBscListener(contracts []common.Address) {
 	}
 
 	runEvmWsLogListener(ctx, mdb.NetworkBsc, "[BSC-WS]", wsNode, query, func(client *ethclient.Client, vLog types.Log) {
-		if len(vLog.Topics) < 3 {
-			return
-		}
-
-		event := vLog.Topics[0].String()
-		if event != transferEventHash.String() {
-			return
-		}
-
-		amount := new(big.Int).SetBytes(vLog.Data)
-
-		toAddr := common.HexToAddress(vLog.Topics[2].Hex())
-
-		if !isWatchedBscRecipient(toAddr) {
-			return
-		}
-
-		var blockTsMs int64
-		header, err := client.HeaderByNumber(context.Background(), big.NewInt(int64(vLog.BlockNumber)))
-		if err != nil {
-			data.RecordRpcFailure(mdb.NetworkBsc)
-			log.Sugar.Warnf("[BSC-WS] HeaderByNumber block=%d: %v, using local time", vLog.BlockNumber, err)
-			blockTsMs = time.Now().UnixMilli()
-		} else {
-			data.RecordRpcSuccess(mdb.NetworkBsc)
-			blockTsMs = int64(header.Time) * 1000
-		}
-
-		service.TryProcessEvmERC20Transfer(mdb.NetworkBsc, vLog.Address, toAddr, amount, vLog.TxHash.Hex(), blockTsMs, vLog.Index)
+		processEvmWsTransfer(ctx, client, mdb.NetworkBsc, "[BSC-WS]", vLog, isWatchedBscRecipient)
 	})
 }
 

@@ -125,7 +125,11 @@ func (t *rpcTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		resp.Request = req
 		status = resp.StatusCode
 	}
-	if data.RecordRpcRequest(t.node, t.reason, status) {
+	reason := t.reason
+	if IsPaidPaymentReview(req.Context()) {
+		reason = "payment_deadline"
+	}
+	if data.RecordRpcRequest(t.node, reason, status) {
 		log.Sugar.Warnf("[RPC] paid request budget reached network=%s; deferring cold addresses, payment verification remains enabled", t.node.Network)
 	}
 	if status == http.StatusTooManyRequests {

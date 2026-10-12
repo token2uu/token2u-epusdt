@@ -132,6 +132,18 @@ func aptosIndexerQuery(ctx context.Context, query string, variables map[string]i
 	if err != nil {
 		return result, err
 	}
+	if IsPaidPaymentReview(ctx) {
+		paid := nodes[:0]
+		for _, node := range nodes {
+			if node.Purpose == mdb.RpcNodePurposePaidFallback {
+				paid = append(paid, node)
+			}
+		}
+		nodes = paid
+		if len(nodes) == 0 {
+			return result, fmt.Errorf("no paid Aptos indexer configured for payment review")
+		}
+	}
 	processor := strings.TrimSpace(viper.GetString("aptos_indexer_processor"))
 	if processor == "" {
 		processor = "fungible_asset_processor"

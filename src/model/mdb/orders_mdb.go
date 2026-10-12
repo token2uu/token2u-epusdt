@@ -37,7 +37,17 @@ const (
 	PaymentProviderOkPay = "okpay"
 )
 
+const (
+	OrderClosedExpired            = "expired"
+	OrderClosedManual             = "manual"
+	OrderClosedSuperseded         = "superseded"
+	OrderClosedReservationUnknown = "reservation_unknown"
+)
+
 type Orders struct {
+	// NULL on pre-upgrade orders: never infer historical rounding from current settings.
+	AmountPrecision    *int       `json:"-"`
+	ClosedReason       string     `gorm:"size:24;default:''" json:"-"`
 	CollectionMode     string     `gorm:"size:24;default:'';index;index:collection_history,priority:1" json:"collection_mode"`
 	PaymentExpiresAt   *time.Time `gorm:"index" json:"payment_expires_at,omitempty"`
 	AssignedAtMs       int64      `gorm:"default:0;index;index:collection_history,priority:5" json:"assigned_at_ms"`

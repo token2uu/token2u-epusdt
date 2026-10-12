@@ -3,13 +3,16 @@ package task
 import (
 	"context"
 	"fmt"
+	"math/big"
 	"time"
 
 	"github.com/GMWalletApp/epusdt/model/data"
 	"github.com/GMWalletApp/epusdt/model/mdb"
+	"github.com/GMWalletApp/epusdt/model/service"
 	"github.com/GMWalletApp/epusdt/util/log"
 
 	"github.com/ethereum/go-ethereum"
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/ethclient"
 )
@@ -18,6 +21,34 @@ const (
 	evmStatsIdleInterval  = 30 * time.Second
 	evmStatsHeaderTimeout = 10 * time.Second
 )
+
+// A failed header read must leave the event to confirmed backfill. Local time
+// cannot prove historical ownership and must never enter a durable receipt.
+func processEvmWsTransfer(ctx context.Context, client *ethclient.Client, network, logPrefix string, event types.Log, isWatched evmRecipientCheckerFunc) {
+	if event.Removed || len(event.Topics) < 3 || event.Topics[0] != transferEventHash {
+		return
+	}
+	recipient := common.HexToAddress(event.Topics[2].Hex())
+	if !isWatched(recipient) {
+		return
+	}
+	header, err := latestEvmBlockHeader(ctx, client, event.BlockNumber)
+	if err == nil && (header == nil || header.Number == nil || header.Number.Cmp(new(big.Int).SetUint64(event.BlockNumber)) != 0 || header.Time == 0 || header.Time > uint64((1<<63-1)/1000)) {
+		err = fmt.Errorf("missing or invalid block header timestamp/number")
+	}
+	if err != nil {
+		if ctx.Err() == nil {
+			data.RecordRpcFailure(network)
+			log.Sugar.Warnf("%s header unavailable block=%d tx=%s: %v; deferring payment to confirmed backfill", logPrefix, event.BlockNumber, event.TxHash.Hex(), err)
+		}
+		return
+	}
+	if ctx.Err() != nil {
+		return
+	}
+	data.RecordRpcSuccess(network)
+	service.TryProcessEvmERC20Transfer(network, event.Address, recipient, new(big.Int).SetBytes(event.Data), event.TxHash.Hex(), int64(header.Time)*1000, event.Index)
+}
 
 // runEvmWsLogListener connects to node.Url, subscribes to Transfer logs,
 // and dispatches each log to handleLog. It retries on transient errors

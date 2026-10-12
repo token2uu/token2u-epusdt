@@ -28,8 +28,16 @@ Authorization: Bearer <admin-token>
 {"purpose":"paid_fallback"}
 ```
 
-新用途和 `type=indexer` 可通过管理 API 配置；本仓库只有已构建的前端静态资源，
-旧界面的下拉选项未随此后端改造更新。需要更新前端选项时应从前端源仓库构建。
+管理页面的新增/编辑节点、节点用途筛选和列表标签均支持“付费回退”。
+选择后保存为 `paid_fallback`，再次编辑时保留该用途。旧界面曾将未知用途显示
+为“通用”，因此不能用旧列表标签判断后端是否完成切换。
+`type=indexer` 仍通过管理 API 配置。
+
+本仓库只有已构建的前端静态资源。这次界面兼容修改由
+`python3 scripts/update-rpc-purpose-ui.py` 生成，包含六种现有语言的文字及
+Service Worker 缓存更新；脚本重复执行不会再修改文件，遇到不兼容的新构建会
+明确失败。后续同步前端时，应优先在前端源仓库加入上述功能后重新构建，并
+保留本项目收银台的既有定制。
 
 Aptos 需要两类备用：`type=http` 的 Fullnode REST RPC 用于核验交易；
 `type=indexer` 的兼容 GraphQL Indexer 用于发现地址入账。普通 Ankr Aptos

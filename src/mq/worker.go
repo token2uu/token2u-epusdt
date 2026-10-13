@@ -85,11 +85,13 @@ func processExpiredOrders() {
 		log.Sugar.Errorf("[mq] exclusive expiration: %v", err)
 	}
 	expirationCutoff := time.Now().Add(-config.GetOrderExpirationTimeDuration())
+	var lastID uint64
 	for {
 		var orders []expirableOrder
 		err := withSQLiteBusyRetry(func() error {
 			return dao.Mdb.Model(&mdb.Orders{}).
 				Select("id", "trade_id", "status", "network", "receive_address", "token", "actual_amount", "pay_provider").
+				Where("id > ?", lastID).
 				Where("status IN ?", []int{mdb.StatusWaitPay, mdb.StatusWaitSelect}).
 				Where("collection_mode <> ?", mdb.CollectionExclusive).
 				Where("(payment_expires_at IS NOT NULL AND payment_expires_at <= ?) OR (payment_expires_at IS NULL AND created_at <= ?)", time.Now(), expirationCutoff).
@@ -104,6 +106,10 @@ func processExpiredOrders() {
 		if len(orders) == 0 {
 			return
 		}
+		// Visit each ID once in this round, including failed writes. Otherwise
+		// a full failing batch spins forever and blocks all later expirations.
+		// The next scheduled round starts from zero and retries those failures.
+		lastID = orders[len(orders)-1].ID
 
 		for _, order := range orders {
 			expired, err := data.UpdateOrderIsExpirationById(order.ID, expirationCutoff, order.Status == mdb.StatusWaitPay)
@@ -228,6 +234,16 @@ func sendOrderCallback(order *mdb.Orders) error {
 
 	default:
 
+		payment := order
+		if order.Status == mdb.StatusPaySuccess && order.PayBySubId != 0 {
+			payment = &mdb.Orders{}
+			if err := dao.Mdb.Where("id = ? AND parent_trade_id = ? AND status = ?", order.PayBySubId, order.TradeId, mdb.StatusPaySuccess).First(payment).Error; err != nil {
+				return err
+			}
+			if strings.TrimSpace(payment.BlockTransactionId) == "" {
+				return errors.New("winning payment channel has no transaction identity")
+			}
+		}
 		client := http_client.GetHttpClient()
 		paidAmount := order.PaidAmount
 		if data.IsPackageEpayNotifyURL(order.NotifyUrl) {
@@ -238,11 +254,11 @@ func sendOrderCallback(order *mdb.Orders) error {
 			TradeId:            order.TradeId,
 			OrderId:            order.OrderId,
 			Amount:             order.Amount,
-			ActualAmount:       order.ActualAmount,
+			ActualAmount:       payment.ActualAmount,
 			PaidAmount:         paidAmount,
-			ReceiveAddress:     order.ReceiveAddress,
-			Token:              order.Token,
-			BlockTransactionId: order.BlockTransactionId,
+			ReceiveAddress:     payment.ReceiveAddress,
+			Token:              payment.Token,
+			BlockTransactionId: payment.BlockTransactionId,
 			Status:             order.Status,
 		}
 		signature, err := sign.GetHMACSHA256(orderResp, apiKeyRow.SecretKey)
@@ -313,25 +329,6 @@ func isCallbackDue(order *data.PendingCallbackOrder, now time.Time, maxRetry int
 	if order.CallbackNum == 0 {
 		return true
 	}
-	nextRunAt := order.UpdatedAt.StdTime().Add(callbackRetryDelay(order.CallbackNum))
+	nextRunAt := order.UpdatedAt.StdTime().Add(data.CallbackRetryDelay(order.CallbackNum))
 	return !nextRunAt.After(now)
-}
-
-func callbackRetryDelay(attempts int) time.Duration {
-	if attempts <= 0 {
-		return 0
-	}
-
-	delay := config.GetCallbackRetryBaseDuration()
-	maxDelay := 5 * time.Minute
-	for i := 1; i < attempts; i++ {
-		if delay >= maxDelay/2 {
-			return maxDelay
-		}
-		delay *= 2
-	}
-	if delay > maxDelay {
-		return maxDelay
-	}
-	return delay
 }

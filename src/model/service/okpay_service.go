@@ -6,15 +6,17 @@ import (
 	"fmt"
 	"net/url"
 	"path"
-	"strconv"
 	"strings"
 	"time"
 
+	"github.com/GMWalletApp/epusdt/model/dao"
 	"github.com/GMWalletApp/epusdt/model/data"
+	"github.com/GMWalletApp/epusdt/model/mdb"
 	"github.com/GMWalletApp/epusdt/model/request"
 	"github.com/GMWalletApp/epusdt/util/constant"
 	"github.com/GMWalletApp/epusdt/util/http_client"
 	"github.com/GMWalletApp/epusdt/util/log"
+	"github.com/shopspring/decimal"
 )
 
 type okPayCreateDepositResponse struct {
@@ -71,6 +73,10 @@ func okPaySign(form map[string]string, shopID string, shopToken string) map[stri
 }
 
 func createOkPayDepositOrder(uniqueID string, amount float64, coin string, returnURL string) (*okPayDepositOrder, error) {
+	return createOkPayDepositRequest(uniqueID, fmt.Sprintf("%.*f", data.GetAmountPrecision(), amount), coin, returnURL)
+}
+
+func createOkPayDepositRequest(uniqueID, amount, coin, returnURL string) (*okPayDepositOrder, error) {
 	shopID := data.GetOkPayShopID()
 	shopToken := data.GetOkPayShopToken()
 	apiURL := strings.TrimSpace(data.GetOkPayAPIURL())
@@ -86,7 +92,7 @@ func createOkPayDepositOrder(uniqueID string, amount float64, coin string, retur
 	form := map[string]string{
 		"unique_id":    uniqueID,
 		"name":         uniqueID,
-		"amount":       fmt.Sprintf("%.*f", data.GetAmountPrecision(), amount),
+		"amount":       amount,
 		"coin":         strings.ToUpper(strings.TrimSpace(coin)),
 		"callback_url": callbackURL,
 		"return_url":   returnURL,
@@ -250,13 +256,33 @@ func HandleOkPayNotify(form map[string]string, rawFormData string) error {
 		return fmt.Errorf("okpay coin mismatch: got=%s want=%s", payload.Coin, order.Token)
 	}
 
-	notifyAmount, err := strconv.ParseFloat(payload.Amount, 64)
+	notifyAmount, err := decimal.NewFromString(payload.Amount)
 	if err != nil {
 		return fmt.Errorf("invalid okpay amount: %w", err)
 	}
-	precision := data.GetAmountPrecision()
-	if fmt.Sprintf("%.*f", precision, notifyAmount) != fmt.Sprintf("%.*f", precision, order.ActualAmount) {
-		return fmt.Errorf("okpay amount mismatch: got=%.*f want=%.*f", precision, notifyAmount, precision, order.ActualAmount)
+	expectedAmount := decimal.NewFromFloat(order.ActualAmount)
+	if providerRow.RequestAmount != "" {
+		expectedAmount, err = decimal.NewFromString(providerRow.RequestAmount)
+		if err != nil {
+			return fmt.Errorf("invalid stored okpay amount: %w", err)
+		}
+	}
+	if !notifyAmount.IsPositive() || !notifyAmount.Equal(expectedAmount) {
+		return fmt.Errorf("okpay amount mismatch: got=%s want=%s", notifyAmount, expectedAmount)
+	}
+	// Bind the first authenticated provider identity before settlement. A late
+	// create response or competing notification must not replace that identity.
+	data.CollectionMu.Lock()
+	bound := dao.Mdb.Model(&mdb.ProviderOrder{}).
+		Where("id = ? AND (provider_order_id = '' OR provider_order_id = ?)", providerRow.ID, payload.OrderID).
+		Where("status IN ?", []string{mdb.ProviderOrderStatusCreating, mdb.ProviderOrderStatusFailed, mdb.ProviderOrderStatusPending, mdb.ProviderOrderStatusPaid}).
+		Update("provider_order_id", payload.OrderID)
+	data.CollectionMu.Unlock()
+	if bound.Error != nil {
+		return bound.Error
+	}
+	if bound.RowsAffected != 1 {
+		return constant.OrderStatusConflict
 	}
 
 	err = orderProcessing(&request.OrderProcessingRequest{
@@ -274,6 +300,13 @@ func HandleOkPayNotify(form map[string]string, rawFormData string) error {
 	processed := err == nil
 	if err != nil && err != constant.OrderBlockAlreadyProcess {
 		return err
+	}
+	confirmed, loadErr := data.GetOrderInfoByTradeId(order.TradeId)
+	if loadErr != nil {
+		return loadErr
+	}
+	if confirmed.Status != mdb.StatusPaySuccess || confirmed.BlockTransactionId != payload.OrderID {
+		return constant.OrderStatusConflict
 	}
 
 	if processed {

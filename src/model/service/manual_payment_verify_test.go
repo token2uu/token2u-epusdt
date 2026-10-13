@@ -18,6 +18,7 @@ import (
 	"github.com/GMWalletApp/epusdt/internal/testutil"
 	"github.com/GMWalletApp/epusdt/model/dao"
 	"github.com/GMWalletApp/epusdt/model/mdb"
+	"github.com/GMWalletApp/epusdt/model/request"
 	addressutil "github.com/GMWalletApp/epusdt/util/address"
 	"github.com/dromara/carbon/v2"
 	"github.com/ethereum/go-ethereum/common"
@@ -164,13 +165,24 @@ func TestValidateManualAptosPayment(t *testing.T) {
 		ActualAmount:   4.2,
 		ReceiveAddress: receive,
 	}
-	got, err := ValidateManualAptosPayment(order, "ABC")
+	evidence := &request.ManualPaymentEvidence{}
+	got, err := ValidateManualAptosPayment(order, "ABC", evidence)
 	if err != nil {
 		t.Fatalf("ValidateManualAptosPayment(): %v", err)
 	}
 	if got != "0xabc" {
 		t.Fatalf("canonical tx id = %q, want %q", got, "0xabc")
 	}
+	if evidence.RawAmount != "4200000" || evidence.BlockTimeMs != 1700000000123 || evidence.Decimals != 6 {
+		t.Fatalf("missing exact Aptos evidence: %+v", evidence)
+	}
+	order.ActualAmount = 5
+	order.NotifyUrl = "https://merchant.invalid/epay/notify"
+	verified, err := ValidateManualOrderPaymentWithPaidAmount(order, "ABC")
+	if err != nil || verified.CanonicalTxID != "0xabc" || verified.PaidAmount != 4.2 {
+		t.Fatalf("amount mismatch lost verified Aptos identity: %+v %v", verified, err)
+	}
+
 }
 
 func TestParseManualTonTxRefAcceptsCanonicalLTAndHashOnly(t *testing.T) {
@@ -268,7 +280,8 @@ func TestValidateManualTonPaymentWithAPINativeTON(t *testing.T) {
 	}
 	ref := manualTonTxRef{LT: tx.LT, HashHex: hex.EncodeToString(tx.Hash), HasLT: true}
 
-	got, err := validateManualTonPaymentWithAPI(context.Background(), api, order, receive, ref)
+	evidence := &request.ManualPaymentEvidence{}
+	got, err := validateManualTonPaymentWithAPI(context.Background(), api, order, receive, ref, evidence)
 	if err != nil {
 		t.Fatalf("validateManualTonPaymentWithAPI(): %v", err)
 	}
@@ -285,6 +298,16 @@ func TestValidateManualTonPaymentWithAPINativeTON(t *testing.T) {
 	if got != want {
 		t.Fatalf("canonical id = %q, want %q", got, want)
 	}
+	if evidence.RawAmount != "1230000000" || evidence.BlockTimeMs != int64(tx.Now)*1000 || evidence.Decimals != 9 {
+		t.Fatalf("missing exact TON evidence: %+v", evidence)
+	}
+	order.ActualAmount = 2
+	got, err = validateManualTonPaymentWithAPI(context.Background(), api, order, receive, ref)
+	var mismatch *AmountMismatchError
+	if !errors.As(err, &mismatch) || got != want || mismatch.ActualPaidAmount != 1.23 {
+		t.Fatalf("amount mismatch lost verified TON identity: %q %v", got, err)
+	}
+
 }
 
 func TestValidateManualTonPaymentCandidatesUSDTJetton(t *testing.T) {
@@ -380,6 +403,13 @@ func TestValidateManualTonPaymentWithAPIRejectsAmbiguousHashOnly(t *testing.T) {
 	if call := api.listCalls[0]; call.limit != 100 || call.lt != tx2.LT || call.hashHex != hex.EncodeToString(tx2.Hash) {
 		t.Fatalf("ListTransactions recent call = %#v, want account last tx cursor", call)
 	}
+	order.ActualAmount = 2
+	got, err := validateManualTonPaymentWithAPI(context.Background(), api, order, receive, manualTonTxRef{HashHex: hex.EncodeToString(tx1.Hash)})
+	var mismatch *AmountMismatchError
+	if err == nil || errors.As(err, &mismatch) || got != "" {
+		t.Fatalf("ambiguous mismatch accepted a transaction identity: %q %v", got, err)
+	}
+
 }
 
 func TestManualVerifyDialEvmClientsIncludesHTTPNode(t *testing.T) {
@@ -611,11 +641,15 @@ func TestManualVerifyEvmRequestFailureFallsBackToNextClient(t *testing.T) {
 	contract := common.HexToAddress("0x1111111111111111111111111111111111111111")
 	to := common.HexToAddress("0x2222222222222222222222222222222222222222")
 	rawAmount := big.NewInt(1230000)
+	txHash := common.HexToHash("0x" + strings.Repeat("c", 64))
+	header := &types.Header{Number: big.NewInt(10), Time: uint64(time.Now().Unix())}
 	receipt := &types.Receipt{
 		Status:      types.ReceiptStatusSuccessful,
 		BlockNumber: big.NewInt(10),
+		TxHash:      txHash, BlockHash: header.Hash(),
 		Logs: []*types.Log{{
 			Address: contract,
+			TxHash:  txHash, BlockHash: header.Hash(), BlockNumber: 10,
 			Topics: []common.Hash{
 				erc20TransferEventHash,
 				common.Hash{},
@@ -632,17 +666,23 @@ func TestManualVerifyEvmRequestFailureFallsBackToNextClient(t *testing.T) {
 		BaseModel:      mdb.BaseModel{CreatedAt: *carbon.NewTime(carbon.CreateFromTimestampMilli(time.Now().Add(-time.Minute).UnixMilli()))},
 	}
 	token := &mdb.ChainToken{Network: mdb.NetworkEthereum, Symbol: "USDT", ContractAddress: contract.Hex(), Decimals: 6}
+	orphanReceipt := *receipt
+	orphanReceipt.BlockHash = common.HexToHash("0x" + strings.Repeat("d", 64))
 
 	err := validateManualEvmPaymentAcrossClients(context.Background(), []manualEvmClient{
 		{label: "ws bad", reader: &fakeEvmReader{receiptErr: errors.New("ws receipt failed")}},
+		{label: "orphan receipt", reader: &fakeEvmReader{
+			receipt: &orphanReceipt,
+			headers: map[string]*types.Header{"10": header},
+		}},
 		{label: "http ok", reader: &fakeEvmReader{
 			receipt: receipt,
 			headers: map[string]*types.Header{
-				"10":     {Number: big.NewInt(10), Time: uint64(time.Now().Unix())},
+				"10":     header,
 				"latest": {Number: big.NewInt(12), Time: uint64(time.Now().Unix())},
 			},
 		}},
-	}, order, common.HexToHash("0x"+strings.Repeat("c", 64)), token)
+	}, order, txHash, token)
 	if err != nil {
 		t.Fatalf("validateManualEvmPaymentAcrossClients(): %v", err)
 	}
@@ -803,12 +843,19 @@ func TestManualVerifyTronPaymentHTTPFlow(t *testing.T) {
 		t.Fatalf("create order: %v", err)
 	}
 
-	got, err := ValidateManualOrderPayment(order, "0X"+strings.ToUpper(txID))
+	verified, err := ValidateManualOrderPaymentWithPaidAmount(order, "0X"+strings.ToUpper(txID))
+	got := ""
+	if verified != nil {
+		got = verified.CanonicalTxID
+	}
 	if err != nil {
 		t.Fatalf("ValidateManualOrderPayment(): %v", err)
 	}
 	if got != txID {
 		t.Fatalf("canonical tx id = %q, want %q", got, txID)
+	}
+	if verified.Evidence == nil || verified.Evidence.RawAmount != rawAmount.String() || verified.Evidence.BlockTimeMs != blockTimeMs || verified.Evidence.AssetID != contractAddress {
+		t.Fatalf("missing exact TRON evidence: %+v", verified)
 	}
 	if requestCalls != 3 {
 		t.Fatalf("manual verify request calls = %d, want 3", requestCalls)

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/GMWalletApp/epusdt/config"
 	"github.com/GMWalletApp/epusdt/model/dao"
@@ -314,6 +315,15 @@ func orderProcessing(req *request.OrderProcessingRequest, opts orderProcessingOp
 
 // ReserveAvailableWalletAndAmount finds and locks a network+address+token+amount pair.
 func ReserveAvailableWalletAndAmount(tradeID string, network string, token string, amount float64, walletAddress []mdb.WalletAddress) (string, float64, error) {
+	asset, err := ensureEnabledOrderAsset(network, token)
+	if err != nil {
+		return "", 0, err
+	}
+	// Validate the rounded checkout amount before taking a runtime lock.
+	// Collision increments must not silently raise an otherwise invalid price.
+	if decimal.NewFromFloat(amount).LessThan(decimal.NewFromFloat(asset.MinAmount)) {
+		return "", 0, constant.PayAmountErr
+	}
 	availableAddress := ""
 	availableAmount := amount
 	amountPrecision := data.GetAmountPrecision()
@@ -392,10 +402,9 @@ func SubmitManualPayment(tradeId, blockTransactionId string) (*response.ManualPa
 	return submitManualPaymentForOrder(order, blockTransactionId, adminManualPaymentStatuses)
 }
 
-// SubmitCashierManualPayment is the public cashier variant. It rejects hashes
-// already stored on any order before touching RPC so repeated/public probes do
-// not spend RPC quota. Admin mark-paid intentionally keeps using
-// SubmitManualPayment and the existing verification path.
+// SubmitCashierManualPayment is the public cashier variant. Old hash-only
+// settlements are rejected before RPC; event-backed transactions are verified
+// to distinguish independent transfers. Only pending orders may use this route.
 func SubmitCashierManualPayment(tradeId, blockTransactionId string) (*response.ManualPaymentResponse, error) {
 	tradeId = strings.TrimSpace(tradeId)
 	blockTransactionId = strings.TrimSpace(blockTransactionId)
@@ -407,8 +416,16 @@ func SubmitCashierManualPayment(tradeId, blockTransactionId string) (*response.M
 	if err = validateManualPaymentOrderWithStatuses(order, manualPaymentWaitPayStatuses); err != nil {
 		return nil, err
 	}
-	if err = ensureManualBlockTransactionUnused(order, blockTransactionId); err != nil {
+	// Only old settlements lacking event evidence claim the whole transaction.
+	// Known receipts need verification first to resolve the selected transfer.
+	data.CollectionMu.Lock()
+	claimed, err := data.PaymentTransactionHasUntrackedSettlement(dao.Mdb, order.Network, blockTransactionId)
+	data.CollectionMu.Unlock()
+	if err != nil {
 		return nil, err
+	}
+	if claimed {
+		return nil, constant.OrderBlockAlreadyProcess
 	}
 	return submitManualPaymentForOrder(order, blockTransactionId, manualPaymentWaitPayStatuses)
 }
@@ -440,7 +457,8 @@ func submitManualPaymentForOrder(order *mdb.Orders, blockTransactionId string, a
 		TradeId:            order.TradeId,
 		BlockTransactionId: validationResult.CanonicalTxID,
 	}
-	if validationResult.PaidAmount > 0 && validationResult.PaidAmount != order.ActualAmount {
+	if validationResult.Evidence != nil {
+		req.ManualPayment = validationResult.Evidence
 		req.PaidAmount = validationResult.PaidAmount
 	}
 
@@ -738,70 +756,45 @@ func completeWaitSelectOkPayOrder(parent *mdb.Orders, token string) (*response.C
 	}
 
 	amount := math.MustParsePrecFloat64(decimalTokenAmount.InexactFloat64(), data.GetAmountPrecision())
-	returnURL := strings.TrimSpace(parent.RedirectUrl)
-	if returnURL == "" {
-		returnURL = data.GetOkPayReturnURL()
-	}
-	if returnURL == "" {
-		returnURL = fmt.Sprintf("%s/pay/checkout-counter/%s", config.GetAppUri(), parent.TradeId)
-	}
-
-	tx := dao.Mdb.Begin()
-	providerRow := &mdb.ProviderOrder{
-		TradeId:         parent.TradeId,
-		Provider:        mdb.PaymentProviderOkPay,
-		ProviderOrderID: "",
-		PayURL:          "",
-		Amount:          amount,
-		Coin:            token,
-		Status:          mdb.ProviderOrderStatusCreating,
-		NotifyRaw:       "",
-	}
-	if err := data.UpsertProviderOrderCreatingWithTransaction(tx, providerRow); err != nil {
-		tx.Rollback()
-		return nil, err
-	}
-	if err := tx.Commit().Error; err != nil {
-		tx.Rollback()
-		return nil, err
-	}
-
-	okpayOrder, err := createOkPayDepositOrder(parent.TradeId, amount, token, returnURL)
-	if err != nil {
-		_ = data.MarkProviderOrderFailed(parent.TradeId, mdb.PaymentProviderOkPay)
-		return nil, constant.PaymentProviderCreateErr
-	}
-
-	finalizeTx := dao.Mdb.Begin()
-	if err = data.UpdateProviderOrderCreatedWithTransaction(finalizeTx, parent.TradeId, mdb.PaymentProviderOkPay, okpayOrder.ProviderOrderID, okpayOrder.PayURL); err != nil {
-		finalizeTx.Rollback()
-		_ = data.MarkProviderOrderFailed(parent.TradeId, mdb.PaymentProviderOkPay)
-		return nil, err
-	}
-	updated, err := data.CompleteWaitSelectOkPayOrderWithTransaction(finalizeTx, parent.TradeId, token, amount)
-	if err != nil {
-		finalizeTx.Rollback()
-		_ = data.MarkProviderOrderFailed(parent.TradeId, mdb.PaymentProviderOkPay)
-		return nil, err
-	}
-	if !updated {
-		finalizeTx.Rollback()
-		_ = data.MarkProviderOrderFailed(parent.TradeId, mdb.PaymentProviderOkPay)
-		return nil, constant.OrderStatusConflict
-	}
-	if err = finalizeTx.Commit().Error; err != nil {
-		finalizeTx.Rollback()
-		_ = data.MarkProviderOrderFailed(parent.TradeId, mdb.PaymentProviderOkPay)
-		return nil, err
-	}
-
-	order, err := data.GetOrderInfoByTradeId(parent.TradeId)
+	// Publish the provider channel before the HTTP request so an early verified
+	// callback sees the same durable amount and identity as a retry after restart.
+	data.CollectionMu.Lock()
+	err := dao.Mdb.Transaction(func(tx *gorm.DB) error {
+		var fresh mdb.Orders
+		if err := tx.Where("trade_id = ?", parent.TradeId).First(&fresh).Error; err != nil {
+			return err
+		}
+		if fresh.Status != mdb.StatusWaitSelect || !data.PaymentDeadline(&fresh).After(time.Now()) {
+			return constant.OrderStatusConflict
+		}
+		var prior mdb.ProviderOrder
+		if err := tx.Where("trade_id = ? AND provider = ?", parent.TradeId, mdb.PaymentProviderOkPay).Find(&prior).Error; err != nil {
+			return err
+		}
+		if prior.ID != 0 {
+			if !strings.EqualFold(prior.Coin, token) {
+				return constant.OrderStatusConflict
+			}
+			amount = prior.Amount // An interrupted older attempt already fixed the quote.
+		}
+		updated, err := data.CompleteWaitSelectOkPayOrderWithTransaction(tx, parent.TradeId, token, amount)
+		if err != nil {
+			return err
+		}
+		if !updated {
+			return constant.OrderStatusConflict
+		}
+		if prior.ID != 0 {
+			return nil
+		}
+		return data.CreateProviderOrderWithTransaction(tx, &mdb.ProviderOrder{TradeId: parent.TradeId, Provider: mdb.PaymentProviderOkPay,
+			Amount: amount, Coin: token, Status: mdb.ProviderOrderStatusCreating})
+	})
+	data.CollectionMu.Unlock()
 	if err != nil {
 		return nil, err
 	}
-	resp := buildCheckoutResponse(order)
-	resp.PaymentUrl = okpayOrder.PayURL
-	return resp, nil
+	return resumeOkPayCheckout(parent.TradeId)
 }
 
 func switchToOkPay(parent *mdb.Orders, token string) (*response.CheckoutCounterResponse, error) {
@@ -834,50 +827,17 @@ func switchToOkPay(parent *mdb.Orders, token string) (*response.CheckoutCounterR
 	}
 
 	if parent.PayProvider == mdb.PaymentProviderOkPay && strings.EqualFold(parent.Token, token) {
-		providerRow, err := data.GetProviderOrderByTradeIDAndProvider(parent.TradeId, mdb.PaymentProviderOkPay)
-		if err != nil {
-			return nil, err
-		}
-		if providerRow.ID == 0 || strings.TrimSpace(providerRow.PayURL) == "" {
-			return nil, constant.SystemErr
-		}
-		_ = data.MarkOrderSelected(parent.TradeId)
-		if err := data.RefreshOrderExpiration(parent.TradeId); err != nil {
-			return nil, err
-		}
-		order, err := data.GetOrderInfoByTradeId(parent.TradeId)
-		if err != nil {
-			return nil, err
-		}
-		resp := buildCheckoutResponse(order)
-		resp.PaymentUrl = providerRow.PayURL
-		return resp, nil
+		return resumeOkPayCheckout(parent.TradeId)
 	}
 
-	existing, err := data.GetSubOrderByTokenPayProvider(parent.TradeId, token, mdb.PaymentProviderOkPay)
-	if err != nil {
+	// Include old failed attempts: they own a stable provider unique_id and
+	// must be recovered, rather than consuming another child slot.
+	var existing mdb.Orders
+	if err := dao.Mdb.Where("parent_trade_id = ? AND token = ? AND pay_provider = ?", parent.TradeId, token, mdb.PaymentProviderOkPay).First(&existing).Error; err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 		return nil, err
 	}
 	if existing.ID > 0 {
-		providerRow, err := data.GetProviderOrderByTradeIDAndProvider(existing.TradeId, mdb.PaymentProviderOkPay)
-		if err != nil {
-			return nil, err
-		}
-		if providerRow.ID == 0 || strings.TrimSpace(providerRow.PayURL) == "" {
-			return nil, constant.SystemErr
-		}
-		updated, markErr := data.MarkProviderSwitchParentSelectedWithTransaction(dao.Mdb, parent.TradeId)
-		if markErr != nil {
-			return nil, markErr
-		}
-		if !updated {
-			return nil, constant.OrderStatusConflict
-		}
-		_ = data.MarkOrderSelected(existing.TradeId)
-		existing.IsSelected = true
-		resp := buildCheckoutResponse(existing)
-		resp.PaymentUrl = providerRow.PayURL
-		return resp, nil
+		return resumeOkPayCheckout(existing.TradeId)
 	}
 
 	count, err := data.CountSubOrders(parent.TradeId)
@@ -900,15 +860,7 @@ func switchToOkPay(parent *mdb.Orders, token string) (*response.CheckoutCounterR
 
 	subTradeID := GenerateCode()
 	amount := math.MustParsePrecFloat64(decimalTokenAmount.InexactFloat64(), data.GetAmountPrecision())
-	returnURL := strings.TrimSpace(parent.RedirectUrl)
-	if returnURL == "" {
-		returnURL = data.GetOkPayReturnURL()
-	}
-	if returnURL == "" {
-		returnURL = fmt.Sprintf("%s/pay/checkout-counter/%s", config.GetAppUri(), parent.TradeId)
-	}
 
-	tx := dao.Mdb.Begin()
 	subOrder := &mdb.Orders{
 		TradeId:          subTradeID,
 		OrderId:          subTradeID,
@@ -935,65 +887,26 @@ func switchToOkPay(parent *mdb.Orders, token string) (*response.CheckoutCounterR
 	if subOrder.CollectionMode != mdb.CollectionExclusive {
 		subOrder.PaymentExpiresAt = nil // legacy channel switches restart the child deadline
 	}
-	if err = data.CreateOrderWithTransaction(tx, subOrder); err != nil {
-		tx.Rollback()
-		return nil, err
-	}
-	providerRow := &mdb.ProviderOrder{
-		TradeId:         subTradeID,
-		Provider:        mdb.PaymentProviderOkPay,
-		ProviderOrderID: "",
-		PayURL:          "",
-		Amount:          amount,
-		Coin:            token,
-		Status:          mdb.ProviderOrderStatusCreating,
-	}
-	if err = data.CreateProviderOrderWithTransaction(tx, providerRow); err != nil {
-		tx.Rollback()
-		return nil, err
-	}
-	if err = tx.Commit().Error; err != nil {
-		tx.Rollback()
-		return nil, err
-	}
-
-	okpayOrder, err := createOkPayDepositOrder(subTradeID, amount, token, returnURL)
+	data.CollectionMu.Lock()
+	err = dao.Mdb.Transaction(func(tx *gorm.DB) error {
+		updated, err := data.MarkProviderSwitchParentSelectedWithTransaction(tx, parent.TradeId)
+		if err != nil {
+			return err
+		}
+		if !updated {
+			return constant.OrderStatusConflict
+		}
+		if err := data.CreateOrderWithTransaction(tx, subOrder); err != nil {
+			return err
+		}
+		return data.CreateProviderOrderWithTransaction(tx, &mdb.ProviderOrder{TradeId: subTradeID, Provider: mdb.PaymentProviderOkPay,
+			Amount: amount, Coin: token, Status: mdb.ProviderOrderStatusCreating})
+	})
+	data.CollectionMu.Unlock()
 	if err != nil {
-		_ = data.MarkProviderOrderFailed(subTradeID, mdb.PaymentProviderOkPay)
-		_ = data.ExpireOrderByTradeID(subTradeID)
-		return nil, constant.PaymentProviderCreateErr
-	}
-
-	finalizeTx := dao.Mdb.Begin()
-	if err = data.UpdateProviderOrderCreatedWithTransaction(finalizeTx, subTradeID, mdb.PaymentProviderOkPay, okpayOrder.ProviderOrderID, okpayOrder.PayURL); err != nil {
-		finalizeTx.Rollback()
-		_ = data.MarkProviderOrderFailed(subTradeID, mdb.PaymentProviderOkPay)
-		_ = data.ExpireOrderByTradeID(subTradeID)
 		return nil, err
 	}
-	updated, err := data.MarkProviderSwitchParentSelectedWithTransaction(finalizeTx, parent.TradeId)
-	if err != nil {
-		finalizeTx.Rollback()
-		_ = data.MarkProviderOrderFailed(subTradeID, mdb.PaymentProviderOkPay)
-		_ = data.ExpireOrderByTradeID(subTradeID)
-		return nil, err
-	}
-	if !updated {
-		finalizeTx.Rollback()
-		_ = data.MarkProviderOrderFailed(subTradeID, mdb.PaymentProviderOkPay)
-		_ = data.ExpireOrderByTradeID(subTradeID)
-		return nil, constant.OrderStatusConflict
-	}
-	if err = finalizeTx.Commit().Error; err != nil {
-		finalizeTx.Rollback()
-		_ = data.MarkProviderOrderFailed(subTradeID, mdb.PaymentProviderOkPay)
-		_ = data.ExpireOrderByTradeID(subTradeID)
-		return nil, err
-	}
-
-	resp := buildCheckoutResponse(subOrder)
-	resp.PaymentUrl = okpayOrder.PayURL
-	return resp, nil
+	return resumeOkPayCheckout(subTradeID)
 }
 
 func okPayTokenAllowed(token string) bool {

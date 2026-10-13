@@ -43,6 +43,8 @@ func TonCanonicalBlockTransactionID(receiveRaw string, lt uint64, txHashHex stri
 	return fmt.Sprintf("ton:%s:%d:%s", strings.ToLower(strings.TrimSpace(receiveRaw)), lt, strings.ToLower(strings.TrimSpace(txHashHex)))
 }
 
+// Preserve positive inbound amounts for ownership-aware settlement. The current
+// minimum must not override an exclusive assignment's snapshot or hide receipts.
 func ParseTonInboundTransfer(tx *tlb.Transaction, receive *address.Address, nativeToken *mdb.ChainToken, jettonWalletTokens map[string]mdb.ChainToken) (*TonObservedTransfer, error) {
 	if tx == nil || receive == nil || tx.IO.In == nil || tx.IO.In.MsgType != tlb.MsgTypeInternal {
 		return nil, nil
@@ -68,9 +70,6 @@ func ParseTonInboundTransfer(tx *tlb.Transaction, receive *address.Address, nati
 			}
 			amount := tonRawAmountToFloat(transfer.Amount.Nano(), token.Decimals)
 			if amount <= 0 {
-				return nil, nil
-			}
-			if token.MinAmount > 0 && amount < token.MinAmount {
 				return nil, nil
 			}
 			return &TonObservedTransfer{
@@ -100,9 +99,6 @@ func ParseTonInboundTransfer(tx *tlb.Transaction, receive *address.Address, nati
 	}
 	amount := tonRawAmountToFloat(rawNano, nativeToken.Decimals)
 	if amount <= 0 {
-		return nil, nil
-	}
-	if nativeToken.MinAmount > 0 && amount < nativeToken.MinAmount {
 		return nil, nil
 	}
 	return &TonObservedTransfer{
@@ -146,6 +142,11 @@ func processLegacyTonTransfer(transfer *TonObservedTransfer) {
 
 	receive := strings.TrimSpace(transfer.ReceiveAddress)
 	if tokenSym == "" || receive == "" || transfer.Amount <= 0 || transfer.BlockID == "" {
+		return
+	}
+	// Exclusive settlement uses its assignment snapshot before this fallback.
+	// Keep the current configured minimum for amount-lock matching.
+	if transfer.Token.MinAmount > 0 && transfer.Amount < transfer.Token.MinAmount {
 		return
 	}
 	log.Sugar.Infof("[TON-%s][%s] observed transfer tx=%s lt=%d amount=%.6f", tokenSym, receive, transfer.BlockID, transfer.LT, transfer.Amount)
@@ -279,11 +280,14 @@ func EnsureTonTransferMatchesOrder(order *mdb.Orders, transfer *TonObservedTrans
 	if !tonOrderAddressMatches(order.ReceiveAddress, transfer.ReceiveAddress) {
 		return fmt.Errorf("transaction recipient mismatch")
 	}
+	if transfer.Token.MinAmount > 0 && transfer.Amount < transfer.Token.MinAmount {
+		return fmt.Errorf("transaction amount below configured minimum")
+	}
 	if transfer.BlockTimeMs <= 0 || transfer.BlockTimeMs < data.PaymentAssignmentTimeMs(order) {
 		return fmt.Errorf("transaction predates the order")
 	}
-	if !amountMatchesRaw(order.ActualAmount, transfer.RawAmount, transfer.Token.Decimals) {
-		return &AmountMismatchError{ActualPaidAmount: rawAmountToFloat(transfer.RawAmount, transfer.Token.Decimals)}
+	if !manualOrderAmountMatches(order, transfer.RawAmount, transfer.Token.Decimals) {
+		return newAmountMismatch(transfer.RawAmount, transfer.Token.Decimals, transfer.BlockTimeMs, transfer.Token.ContractAddress)
 	}
 	return nil
 }

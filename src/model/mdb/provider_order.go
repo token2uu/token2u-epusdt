@@ -35,8 +35,11 @@ type ProviderOrder struct {
 	// Amount/Coin mirror the exact payload submitted to the provider, which may
 	// be useful when validating callbacks and troubleshooting mismatches.
 	Amount float64 `gorm:"column:amount" json:"amount" example:"14.2857"`
-	Coin   string  `gorm:"column:coin;size:16;not null;default:''" json:"coin" example:"USDT"`
-	Status string  `gorm:"column:status;size:32;not null;default:pending;index:provider_orders_provider_status_index,priority:2" json:"status" example:"pending"`
+	// Freeze the unsigned creation payload across timeout/restart retries.
+	RequestAmount string `gorm:"size:120;default:''" json:"-"`
+	ReturnURL     string `gorm:"size:2048;default:''" json:"-"`
+	Coin          string `gorm:"column:coin;size:16;not null;default:''" json:"coin" example:"USDT"`
+	Status        string `gorm:"column:status;size:32;not null;default:pending;index:provider_orders_provider_status_index,priority:2" json:"status" example:"pending"`
 	// NotifyRaw stores the original provider callback payload for auditing and
 	// replay/debug use. It is provider-specific and intentionally opaque here.
 	NotifyRaw string `gorm:"column:notify_raw;type:text" json:"notify_raw"`

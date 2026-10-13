@@ -1,6 +1,7 @@
 package data
 
 import (
+	"fmt"
 	"strings"
 	"time"
 
@@ -8,9 +9,56 @@ import (
 	"github.com/GMWalletApp/epusdt/model/dao"
 	"github.com/GMWalletApp/epusdt/model/mdb"
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
-// PaymentScanStartTime covers both new payments and any older pending order.
+// Freeze before contacting a node. Initial outages may outlive order expiry;
+// naturally expired orders therefore have no age limit in this bootstrap query.
+func EnsureNetworkScanStartTime(network string, now time.Time) (time.Time, error) {
+	key := network + ":bootstrap_time"
+	stored, err := LoadPaymentCursor(key)
+	if err != nil {
+		return time.Time{}, err
+	}
+	if stored == "" {
+		start := now.Add(-config.GetOrderExpirationTimeDuration() - 5*time.Minute)
+		for _, spec := range []struct{ filter, order string }{
+			{"assigned_at_ms > 0", "assigned_at_ms ASC"},
+			{"assigned_at_ms = 0", "created_at ASC"},
+		} {
+			var oldest mdb.Orders
+			err := dao.Mdb.Where("network = ? AND receive_address <> '' AND (pay_provider = ? OR pay_provider = '')", network, mdb.PaymentProviderOnChain).
+				Where("status = ? OR (status = ? AND closed_reason = ?)", mdb.StatusWaitPay, mdb.StatusExpired, mdb.OrderClosedExpired).
+				Where(spec.filter).Order(spec.order).Limit(1).Find(&oldest).Error
+			if err != nil {
+				return time.Time{}, err
+			}
+			if oldest.ID != 0 {
+				assigned := time.UnixMilli(PaymentAssignmentTimeMs(&oldest))
+				if assigned.Before(start) {
+					start = assigned
+				}
+			}
+		}
+		row := mdb.PaymentScanCursor{Key: key, Position: start.UTC().Format(time.RFC3339Nano)}
+		if err := dao.Mdb.Clauses(clause.OnConflict{DoNothing: true}).Create(&row).Error; err != nil {
+			return time.Time{}, err
+		}
+		stored, err = LoadPaymentCursor(key)
+		if err != nil {
+			return time.Time{}, err
+		}
+	}
+	start, err := time.Parse(time.RFC3339Nano, stored)
+	if err != nil || start.UnixMilli() <= 0 || start.After(now) {
+		return time.Time{}, fmt.Errorf("invalid %s bootstrap time", network)
+	}
+	return start, nil
+}
+
+// PaymentScanStartTime covers pending and naturally expired on-chain orders.
+// The paid review grace controls scheduling, not historical payment ownership:
+// an order may expire long before this address's first scanner round.
 // Persist this before requesting a remote head so outages cannot move it forward.
 func PaymentScanStartTime(network, address string, now time.Time) (time.Time, error) {
 	start := now.Add(-config.GetOrderExpirationTimeDuration() - 5*time.Minute)
@@ -19,8 +67,9 @@ func PaymentScanStartTime(network, address string, now time.Time) (time.Time, er
 		{"assigned_at_ms > 0", "assigned_at_ms ASC"},
 	} {
 		var oldest mdb.Orders
-		q := dao.Mdb.Where("network = ? AND (status = ? OR (status = ? AND updated_at >= ?))", network,
-			mdb.StatusWaitPay, mdb.StatusExpired, now.Add(-time.Duration(config.PaymentReviewGraceSeconds())*time.Second)).Where(spec.filter)
+		q := dao.Mdb.Where("network = ? AND (pay_provider = ? OR pay_provider = '')", network, mdb.PaymentProviderOnChain).
+			Where("status = ? OR (status = ? AND closed_reason = ?)", mdb.StatusWaitPay, mdb.StatusExpired, mdb.OrderClosedExpired).
+			Where(spec.filter)
 		err := q.Where("receive_address = ?", address).Order(spec.order).First(&oldest).Error
 		if err != nil && err != gorm.ErrRecordNotFound {
 			return time.Time{}, err

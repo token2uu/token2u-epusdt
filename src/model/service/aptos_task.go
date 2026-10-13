@@ -12,6 +12,7 @@ import (
 
 	"github.com/GMWalletApp/epusdt/model/data"
 	"github.com/GMWalletApp/epusdt/model/mdb"
+	"github.com/GMWalletApp/epusdt/model/request"
 	addressutil "github.com/GMWalletApp/epusdt/util/address"
 	"github.com/GMWalletApp/epusdt/util/log"
 	"github.com/tidwall/gjson"
@@ -345,7 +346,7 @@ func normalizeAptosTxID(txID string) string {
 	return "0x" + txID
 }
 
-func ValidateManualAptosPayment(order *mdb.Orders, txID string) (string, error) {
+func ValidateManualAptosPayment(order *mdb.Orders, txID string, evidence ...*request.ManualPaymentEvidence) (string, error) {
 	txID = normalizeAptosTxID(txID)
 	nodes, err := data.ListManualPaymentRpcCandidates(mdb.NetworkAptos, mdb.RpcNodeTypeHttp)
 	if err != nil {
@@ -361,7 +362,7 @@ func ValidateManualAptosPayment(order *mdb.Orders, txID string) (string, error) 
 		if strings.TrimSpace(node.Url) == "" {
 			continue
 		}
-		if _, err = validateManualAptosPaymentWithNode(order, txID, node); err != nil {
+		if _, err = validateManualAptosPaymentWithNode(order, txID, node, evidence...); err != nil {
 			if mismatchErr == nil {
 				errors.As(err, &mismatchErr)
 			}
@@ -371,7 +372,7 @@ func ValidateManualAptosPayment(order *mdb.Orders, txID string) (string, error) 
 		return txID, nil
 	}
 	if mismatchErr != nil {
-		return "", mismatchErr
+		return txID, mismatchErr
 	}
 	if len(verifyErrors) > 0 {
 		return "", fmt.Errorf("manual Aptos verification failed: %s", strings.Join(verifyErrors, "; "))
@@ -379,7 +380,7 @@ func ValidateManualAptosPayment(order *mdb.Orders, txID string) (string, error) 
 	return "", fmt.Errorf("no enabled %s %s RPC node configured in rpc_nodes", mdb.NetworkAptos, mdb.RpcNodeTypeHttp)
 }
 
-func validateManualAptosPaymentWithNode(order *mdb.Orders, txID string, node mdb.RpcNode) (string, error) {
+func validateManualAptosPaymentWithNode(order *mdb.Orders, txID string, node mdb.RpcNode, evidence ...*request.ManualPaymentEvidence) (string, error) {
 	txID = normalizeAptosTxID(txID)
 	body, err := aptosGetWithNode(node, fmt.Sprintf("/v1/transactions/by_hash/%s", txID))
 	if err != nil {
@@ -387,7 +388,7 @@ func validateManualAptosPaymentWithNode(order *mdb.Orders, txID string, node mdb
 	}
 	if err = validateManualAptosTransactionWithConfirm(order, txID, body, func(version int64) error {
 		return ensureAptosTransferConfirmedWithNode(version, node)
-	}); err != nil {
+	}, evidence...); err != nil {
 		return "", err
 	}
 	return txID, nil
@@ -397,7 +398,7 @@ func validateManualAptosTransaction(order *mdb.Orders, txID string, body []byte)
 	return validateManualAptosTransactionWithConfirm(order, txID, body, EnsureAptosTransferConfirmed)
 }
 
-func validateManualAptosTransactionWithConfirm(order *mdb.Orders, txID string, body []byte, confirm func(int64) error) error {
+func validateManualAptosTransactionWithConfirm(order *mdb.Orders, txID string, body []byte, confirm func(int64) error, evidence ...*request.ManualPaymentEvidence) error {
 	tokens, err := data.ListEnabledChainTokensByNetwork(mdb.NetworkAptos)
 	if err != nil {
 		return err
@@ -416,6 +417,7 @@ func validateManualAptosTransactionWithConfirm(order *mdb.Orders, txID string, b
 			return err
 		}
 		if err = EnsureMoveTransferMatchesOrder(order, transfer); err == nil {
+			captureManualEvidence(evidence, transfer.RawAmount, transfer.Decimals, transfer.BlockTimeMs, transfer.AssetID, MoveTransferCacheKey(transfer))
 			return nil
 		} else if amtErr := (*AmountMismatchError)(nil); errors.As(err, &amtErr) {
 			if mismatchErr == nil {

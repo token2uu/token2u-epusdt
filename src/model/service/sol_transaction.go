@@ -20,33 +20,9 @@ func solGetTransactionTransfersWithContext(ctx context.Context, signature string
 	_, err := solRetryClientValidatedWithContext(ctx, "getTransaction", []interface{}{signature, map[string]interface{}{
 		"encoding": "jsonParsed", "commitment": "finalized", "maxSupportedTransactionVersion": 0,
 	}}, func(body []byte) error {
-		result := gjson.GetBytes(body, "result")
-		signatures := result.Get("transaction.signatures")
-		if !signatures.IsArray() || len(signatures.Array()) == 0 || signatures.Array()[0].Type != gjson.String || signatures.Array()[0].String() != signature {
-			return fmt.Errorf("RPC transaction signature does not match request")
-		}
-		var parseErr error
-		transfers, parseErr = parseSolTransactionTransfers(body, watchedAddresses)
-		if parseErr == nil {
-			for _, transfer := range transfers {
-				if transfer == nil {
-					continue
-				}
-				for _, address := range watchedAddresses {
-					if transfer.Destination == address {
-						if token := tokens[transfer.Mint]; token != nil && (transfer.Decimals == nil || *transfer.Decimals != token.Decimals) {
-							return fmt.Errorf("incoming token decimals do not match configured asset")
-						}
-						stamp := result.Get("blockTime")
-						seconds, err := strconv.ParseInt(stamp.Raw, 10, 64)
-						if stamp.Type != gjson.Number || err != nil || seconds <= 0 || seconds > (1<<63-1)/1000 {
-							return fmt.Errorf("incoming transaction block time is unavailable")
-						}
-					}
-				}
-			}
-		}
-		return parseErr
+		var err error
+		transfers, err = validateSolTransactionTransfers(body, signature, watchedAddresses, tokens)
+		return err
 	})
 	return transfers, err
 }
@@ -259,4 +235,35 @@ func validateSolPaymentInstruction(instruction gjson.Result) error {
 		return fmt.Errorf("invalid transfer amount: %w", err)
 	}
 	return nil
+}
+
+// Share signature, complete instruction, timestamp and asset validation between
+// automatic scans and the manually selected RPC endpoint.
+func validateSolTransactionTransfers(body []byte, signature string, watchedAddresses []string, tokens map[string]*mdb.ChainToken) ([]*TransferInfo, error) {
+	result := gjson.GetBytes(body, "result")
+	signatures := result.Get("transaction.signatures")
+	if !signatures.IsArray() || len(signatures.Array()) == 0 || signatures.Array()[0].Type != gjson.String || signatures.Array()[0].String() != signature {
+		return nil, fmt.Errorf("RPC transaction signature does not match request")
+	}
+	transfers, parseErr := parseSolTransactionTransfers(body, watchedAddresses)
+	if parseErr == nil {
+		for _, transfer := range transfers {
+			if transfer == nil {
+				continue
+			}
+			for _, address := range watchedAddresses {
+				if transfer.Destination == address {
+					if token := tokens[transfer.Mint]; token != nil && (transfer.Decimals == nil || *transfer.Decimals != token.Decimals) {
+						return nil, fmt.Errorf("incoming token decimals do not match configured asset")
+					}
+					stamp := result.Get("blockTime")
+					seconds, err := strconv.ParseInt(stamp.Raw, 10, 64)
+					if stamp.Type != gjson.Number || err != nil || seconds <= 0 || seconds > (1<<63-1)/1000 {
+						return nil, fmt.Errorf("incoming transaction block time is unavailable")
+					}
+				}
+			}
+		}
+	}
+	return transfers, parseErr
 }

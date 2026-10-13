@@ -1,7 +1,6 @@
 package data
 
 import (
-	"crypto/sha256"
 	"fmt"
 	"sort"
 	"time"
@@ -80,11 +79,12 @@ func SettleLegacyObservedPaymentWithResult(p ObservedPayment) (handled bool, set
 		return
 	}
 	p.Network, p.Token = normalizeLockNetwork(p.Network), normalizeLockToken(p.Token)
+	p.TxHash = CanonicalPaymentTransactionID(p.Network, p.TxHash)
 	p.Address = normalizeLockAddress(p.Network, p.Address)
 	CollectionMu.Lock()
 	defer CollectionMu.Unlock()
 	err = dao.Mdb.Transaction(func(tx *gorm.DB) error {
-		key := fmt.Sprintf("%x", sha256.Sum256([]byte(p.Network+"\x00"+p.TxHash+"\x00"+p.EventID)))
+		key := paymentEventKey(p.Network, p.TxHash, p.EventID)
 		var receipt mdb.PaymentReceipt
 		if err := tx.Where("event_key = ?", key).Find(&receipt).Error; err != nil {
 			return err
@@ -102,90 +102,11 @@ func SettleLegacyObservedPaymentWithResult(p ObservedPayment) (handled bool, set
 			handled = true
 			return nil
 		}
-		start, end := p.BlockTimeMs, p.BlockTimeMs
-		if p.Network == mdb.NetworkSolana || p.Network == mdb.NetworkTon || isEVMNetwork(p.Network) {
-			start = start / 1000 * 1000
-			end = start + 999
-		}
-		var history []mdb.Orders
-		// Restrict the scan to windows that can intersect this payment. Reused
-		// addresses can have years of orders; do not serialize all that history.
-		q := tx.Where("network = ? AND token = ? AND collection_mode <> ?", p.Network, p.Token, mdb.CollectionExclusive).
-			Where("(pay_provider = ? OR pay_provider = '')", mdb.PaymentProviderOnChain).
-			Where("(assigned_at_ms > 0 AND assigned_at_ms <= ?) OR (assigned_at_ms = 0 AND created_at <= ?)", end, time.UnixMilli(end)).
-			Where("released_at_ms = 0 OR released_at_ms > ?", start).
-			Where("payment_expires_at > ? OR (payment_expires_at IS NULL AND created_at > ?)", time.UnixMilli(start), time.UnixMilli(start).Add(-config.GetOrderExpirationTimeDuration()))
-		if err := applyOrderReceiveAddressFilter(q, p.Network, p.Address).Find(&history).Error; err != nil {
-			return err
-		}
-		// Preserve pre-upgrade reservation evidence while it still exists. Orders
-		// without either snapshot must use exact amounts, never today's precision.
-		var missing []string
-		for _, order := range history {
-			if order.AmountPrecision == nil {
-				missing = append(missing, order.TradeId)
-			}
-		}
-		if len(missing) > 0 {
-			var locks []mdb.TransactionLock
-			if err := dao.RuntimeDB.Where("trade_id IN ?", missing).Find(&locks).Error; err != nil {
-				return err
-			}
-			for i := range history {
-				for _, lock := range locks {
-					if history[i].AmountPrecision == nil && history[i].TradeId == lock.TradeId {
-						precision := NormalizeAmountPrecision(lock.AmountPrecision)
-						history[i].AmountPrecision = &precision
-						if err := tx.Model(&mdb.Orders{}).Where("id = ? AND amount_precision IS NULL", history[i].ID).UpdateColumn("amount_precision", precision).Error; err != nil {
-							return err
-						}
-					}
-				}
-			}
-		}
+		start, end := paymentChainTimeInterval(p)
 		amount := decimal.NewFromBigInt(p.RawAmount, -int32(p.Decimals))
-		// Migration ends legacy ownership at the first exclusive assignment.
-		// Its historical timestamp, not the current slot owner, defines the cut.
-		var exclusive mdb.Orders
-		exclusiveQuery := tx.Where("network = ? AND token = ? AND collection_mode = ? AND assigned_at_ms > 0", p.Network, p.Token, mdb.CollectionExclusive)
-		if err := applyOrderReceiveAddressFilter(exclusiveQuery, p.Network, p.Address).Order("assigned_at_ms ASC").Limit(1).Find(&exclusive).Error; err != nil {
+		candidates, ownershipEnds, err := legacyPaymentCandidates(tx, p)
+		if err != nil {
 			return err
-		}
-		var exactCandidates, fallbackCandidates []mdb.Orders
-		ownershipEnds := make(map[uint64]int64)
-		for _, order := range history {
-			assigned := PaymentAssignmentTimeMs(&order)
-			until := PaymentDeadline(&order).UnixMilli()
-			if order.ReleasedAtMs > 0 && order.ReleasedAtMs < until {
-				until = order.ReleasedAtMs
-			}
-			if exclusive.AssignedAtMs > 0 && exclusive.AssignedAtMs < until {
-				until = exclusive.AssignedAtMs
-			}
-			// A later reservation of exactly the same slot proves release even
-			// when an old refreshed parent still says pending. Include successors
-			// that have themselves expired/closed; the filtered history omits them.
-			until, err = legacyOwnershipEnd(tx, &order, until, end)
-			if err != nil {
-				return err
-			}
-			if end < assigned || start >= until {
-				continue
-			}
-			ownershipEnds[order.ID] = until
-			exact := historicalAmountMatches(&order, amount)
-			if !exact && (!IsEpayNotifyURL(order.NotifyUrl) || IsPackageEpayNotifyURL(order.NotifyUrl)) {
-				continue
-			}
-			if exact {
-				exactCandidates = append(exactCandidates, order)
-			} else {
-				fallbackCandidates = append(fallbackCandidates, order)
-			}
-		}
-		candidates := exactCandidates
-		if len(candidates) == 0 {
-			candidates = fallbackCandidates
 		}
 		receipt = mdb.PaymentReceipt{EventKey: key, Network: p.Network, Address: p.Address, Token: p.Token,
 			AssetID: PaymentAssetID(p.Network, p.AssetID), TxHash: p.TxHash, EventID: p.EventID,
@@ -258,11 +179,11 @@ func SettleLegacyObservedPaymentWithResult(p ObservedPayment) (handled bool, set
 				return tx.Create(&receipt).Error
 			}
 		}
-		var duplicates int64
-		if err := tx.Model(&mdb.Orders{}).Where("network = ? AND block_transaction_id = ? AND status = ?", p.Network, p.TxHash, mdb.StatusPaySuccess).Count(&duplicates).Error; err != nil {
+		duplicate, err := PaymentEventAlreadyClaimed(tx, p.Network, p.TxHash, p.EventID)
+		if err != nil {
 			return err
 		}
-		if duplicates > 0 {
+		if duplicate {
 			receipt.Reason = "duplicate_payment"
 			return tx.Create(&receipt).Error
 		}
@@ -270,7 +191,9 @@ func SettleLegacyObservedPaymentWithResult(p ObservedPayment) (handled bool, set
 		if order.ActualAmount <= 0 || order.Amount <= 0 {
 			return fmt.Errorf("invalid historical settlement amount")
 		}
-		if !amount.Equal(decimal.NewFromFloat(order.ActualAmount)) {
+		// Ownership and settlement use the same persisted precision, including
+		// the full-payment callback sentinel shared with manual verification.
+		if !historicalAmountMatches(order, amount) {
 			paid = amount.Mul(decimal.NewFromFloat(order.Amount)).Div(decimal.NewFromFloat(order.ActualAmount)).Round(2)
 			if !paid.IsPositive() {
 				receipt.Reason = "below_settlement_precision"
@@ -323,4 +246,100 @@ func historicalAmountMatches(order *mdb.Orders, amount decimal.Decimal) bool {
 	}
 	precision := int32(NormalizeAmountPrecision(*order.AmountPrecision))
 	return amount.Round(precision).Equal(expected.Round(precision))
+}
+
+// Both automatic recovery and manual amount fallback must select the same
+// historical owner, including closed orders and exact-amount competitors.
+func legacyPaymentCandidates(tx *gorm.DB, p ObservedPayment) ([]mdb.Orders, map[uint64]int64, error) {
+	start, end := paymentChainTimeInterval(p)
+	var history []mdb.Orders
+	// Restrict the scan to windows that can intersect this payment. Reused
+	// addresses can have years of orders; do not serialize all that history.
+	q := tx.Where("network = ? AND token = ? AND collection_mode <> ?", p.Network, p.Token, mdb.CollectionExclusive).
+		Where("(pay_provider = ? OR pay_provider = '')", mdb.PaymentProviderOnChain).
+		Where("(assigned_at_ms > 0 AND assigned_at_ms <= ?) OR (assigned_at_ms = 0 AND created_at <= ?)", end, time.UnixMilli(end)).
+		Where("released_at_ms = 0 OR released_at_ms > ?", start).
+		Where("payment_expires_at > ? OR (payment_expires_at IS NULL AND created_at > ?)", time.UnixMilli(start), time.UnixMilli(start).Add(-config.GetOrderExpirationTimeDuration()))
+	if err := applyOrderReceiveAddressFilter(q, p.Network, p.Address).Find(&history).Error; err != nil {
+		return nil, nil, err
+	}
+	// Preserve pre-upgrade reservation evidence while it still exists. Orders
+	// without either snapshot must use exact amounts, never today's precision.
+	var missing []string
+	for _, order := range history {
+		if order.AmountPrecision == nil {
+			missing = append(missing, order.TradeId)
+		}
+	}
+	if len(missing) > 0 {
+		var locks []mdb.TransactionLock
+		if err := dao.RuntimeDB.Where("trade_id IN ?", missing).Find(&locks).Error; err != nil {
+			return nil, nil, err
+		}
+		for i := range history {
+			for _, lock := range locks {
+				if history[i].AmountPrecision == nil && history[i].TradeId == lock.TradeId {
+					precision := NormalizeAmountPrecision(lock.AmountPrecision)
+					history[i].AmountPrecision = &precision
+					if err := tx.Model(&mdb.Orders{}).Where("id = ? AND amount_precision IS NULL", history[i].ID).UpdateColumn("amount_precision", precision).Error; err != nil {
+						return nil, nil, err
+					}
+				}
+			}
+		}
+	}
+	amount := decimal.NewFromBigInt(p.RawAmount, -int32(p.Decimals))
+	// Migration ends legacy ownership at the first exclusive assignment.
+	// Its historical timestamp, not the current slot owner, defines the cut.
+	var exclusive mdb.Orders
+	exclusiveQuery := tx.Where("network = ? AND token = ? AND collection_mode = ? AND assigned_at_ms > 0", p.Network, p.Token, mdb.CollectionExclusive)
+	if err := applyOrderReceiveAddressFilter(exclusiveQuery, p.Network, p.Address).Order("assigned_at_ms ASC").Limit(1).Find(&exclusive).Error; err != nil {
+		return nil, nil, err
+	}
+	var exactCandidates, fallbackCandidates []mdb.Orders
+	ownershipEnds := make(map[uint64]int64)
+	for _, order := range history {
+		assigned := PaymentAssignmentTimeMs(&order)
+		until := PaymentDeadline(&order).UnixMilli()
+		if order.ReleasedAtMs > 0 && order.ReleasedAtMs < until {
+			until = order.ReleasedAtMs
+		}
+		if exclusive.AssignedAtMs > 0 && exclusive.AssignedAtMs < until {
+			until = exclusive.AssignedAtMs
+		}
+		// A later reservation of exactly the same slot proves release even
+		// when an old refreshed parent still says pending. Include successors
+		// that have themselves expired/closed; the filtered history omits them.
+		var err error
+		until, err = legacyOwnershipEnd(tx, &order, until, end)
+		if err != nil {
+			return nil, nil, err
+		}
+		if end < assigned || start >= until {
+			continue
+		}
+		ownershipEnds[order.ID] = until
+		exact := historicalAmountMatches(&order, amount)
+		if !exact && (!IsEpayNotifyURL(order.NotifyUrl) || IsPackageEpayNotifyURL(order.NotifyUrl)) {
+			continue
+		}
+		if exact {
+			exactCandidates = append(exactCandidates, order)
+		} else {
+			fallbackCandidates = append(fallbackCandidates, order)
+		}
+	}
+	candidates := exactCandidates
+	if len(candidates) == 0 {
+		candidates = fallbackCandidates
+	}
+	return candidates, ownershipEnds, nil
+}
+func paymentChainTimeInterval(p ObservedPayment) (start, end int64) {
+	start, end = p.BlockTimeMs, p.BlockTimeMs
+	if p.Network == mdb.NetworkSolana || p.Network == mdb.NetworkTon || isEVMNetwork(p.Network) {
+		start = start / 1000 * 1000
+		end = start + 999
+	}
+	return
 }

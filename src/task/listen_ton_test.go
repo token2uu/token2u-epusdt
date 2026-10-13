@@ -49,6 +49,15 @@ type fakeTonScannerAPI struct {
 	cancelAtLookupSeq uint32
 }
 
+// Default fixtures predate the initial payment window. Bootstrap tests supply
+// recent chain times and exercise historical backfill explicitly.
+func (f *fakeTonScannerAPI) GetBlockHeader(_ context.Context, b *ton.BlockIDExt) (*tlb.BlockHeader, error) {
+	out := &tlb.BlockHeader{}
+	out.SeqNo = b.SeqNo
+	out.GenUtime = 1000
+	return out, nil
+}
+
 func (f *fakeTonScannerAPI) CurrentMasterchainInfo(context.Context) (*ton.BlockIDExt, error) {
 	return f.head, nil
 }
@@ -87,6 +96,12 @@ func (f *fakeTonShardAPI) GetBlockTransactionsV2(_ context.Context, block *ton.B
 		f.fetchedShardSeqNos = append(f.fetchedShardSeqNos, block.SeqNo)
 	}
 	return f.blockShorts(block), f.incomplete, nil
+}
+
+func (f *fakeTonShardAPI) GetBlockData(_ context.Context, b *ton.BlockIDExt) (*tlb.Block, error) {
+	parent := *b
+	parent.SeqNo--
+	return &tlb.Block{BlockInfo: *tonTestHeader(b, &parent)}, nil
 }
 
 func (f *fakeTonShardAPI) blockShorts(block *ton.BlockIDExt) []ton.TransactionShortInfo {
@@ -183,7 +198,7 @@ func TestRunTonScannerInitializesCursorAtCurrentHead(t *testing.T) {
 		FileHash:  bytes.Repeat([]byte{0x78}, 32),
 	}}
 	cursor := &tonRuntimeCursor{}
-	if err := runTonScanner(ctx, api, newTonJettonWalletCache(), cursor); err != nil {
+	if err := runTonScanner(ctx, api, newTonJettonWalletCache(), cursor, mdb.RpcNode{Url: t.Name()}); err != nil {
 		t.Fatalf("runTonScanner(): %v", err)
 	}
 	if !cursor.initialized {
@@ -192,8 +207,8 @@ func TestRunTonScannerInitializesCursorAtCurrentHead(t *testing.T) {
 	if cursor.lastMasterSeqNo != 77 {
 		t.Fatalf("cursor seqno = %d, want 77", cursor.lastMasterSeqNo)
 	}
-	if len(api.lookups) != 0 {
-		t.Fatalf("initial cursor should not backfill, lookups=%#v", api.lookups)
+	if len(api.lookups) != 1 || api.lookups[0] != 77 {
+		t.Fatalf("head predates scan boundary; only timestamp lookup expected, lookups=%#v", api.lookups)
 	}
 }
 
@@ -232,7 +247,7 @@ func TestRunTonScannerIdleStatesPreserveInitializedCursor(t *testing.T) {
 				head: &ton.BlockIDExt{Workchain: address.MasterchainID, Shard: tonMasterShard, SeqNo: 11},
 			}
 			cursor := &tonRuntimeCursor{initialized: true, lastMasterSeqNo: 10}
-			if err := runTonScanner(ctx, api, newTonJettonWalletCache(), cursor); err != nil {
+			if err := runTonScanner(ctx, api, newTonJettonWalletCache(), cursor, mdb.RpcNode{Url: t.Name()}); err != nil {
 				t.Fatalf("runTonScanner(): %v", err)
 			}
 			if !cursor.initialized || cursor.lastMasterSeqNo != 10 {
@@ -252,7 +267,7 @@ func TestRunTonScannerDoesNotAdvanceCursorOnMasterProcessingFailure(t *testing.T
 		shardsErr: errors.New("shard fetch failed"),
 	}
 	cursor := &tonRuntimeCursor{initialized: true, lastMasterSeqNo: 10}
-	err := runTonScanner(context.Background(), api, newTonJettonWalletCache(), cursor)
+	err := runTonScanner(context.Background(), api, newTonJettonWalletCache(), cursor, mdb.RpcNode{Url: t.Name()})
 	if err == nil {
 		t.Fatal("expected scanner failure")
 	}
@@ -266,7 +281,7 @@ func TestRunTonScannerDoesNotAdvanceCursorOnMasterProcessingFailure(t *testing.T
 		head:   &ton.BlockIDExt{Workchain: address.MasterchainID, Shard: tonMasterShard, SeqNo: 11},
 		shards: nil,
 	}
-	if err := runTonScanner(ctx, api, newTonJettonWalletCache(), cursor); err != nil {
+	if err := runTonScanner(ctx, api, newTonJettonWalletCache(), cursor, mdb.RpcNode{Url: t.Name()}); err != nil {
 		t.Fatalf("runTonScanner retry: %v", err)
 	}
 	if len(api.lookups) != 1 || api.lookups[0] != 11 {
@@ -287,7 +302,7 @@ func TestRunTonScannerDoesNotMarkCursorInitializedOnInitialShardFailure(t *testi
 		shardsErr: errors.New("initial shard fetch failed"),
 	}
 	cursor := &tonRuntimeCursor{}
-	err := runTonScanner(context.Background(), api, newTonJettonWalletCache(), cursor)
+	err := runTonScanner(context.Background(), api, newTonJettonWalletCache(), cursor, mdb.RpcNode{Url: t.Name()})
 	if err == nil {
 		t.Fatal("expected scanner failure")
 	}
@@ -313,7 +328,7 @@ func TestRunTonScannerRespectsMinConfirmations(t *testing.T) {
 		head: &ton.BlockIDExt{Workchain: address.MasterchainID, Shard: tonMasterShard, SeqNo: 12},
 	}
 	cursor := &tonRuntimeCursor{initialized: true, lastMasterSeqNo: 10}
-	if err := runTonScanner(ctx, api, newTonJettonWalletCache(), cursor); err != nil {
+	if err := runTonScanner(ctx, api, newTonJettonWalletCache(), cursor, mdb.RpcNode{Url: t.Name()}); err != nil {
 		t.Fatalf("runTonScanner(): %v", err)
 	}
 	if len(api.lookups) != 0 {
@@ -336,7 +351,7 @@ func TestRunTonScannerCatchupProcessesAtMostFiftyMasterBlocksPerTick(t *testing.
 		shards: nil,
 	}
 	cursor := &tonRuntimeCursor{initialized: true, lastMasterSeqNo: 1}
-	if err := runTonScanner(ctx, api, newTonJettonWalletCache(), cursor); err != nil {
+	if err := runTonScanner(ctx, api, newTonJettonWalletCache(), cursor, mdb.RpcNode{Url: t.Name()}); err != nil {
 		t.Fatalf("runTonScanner(): %v", err)
 	}
 	if len(api.lookups) != int(tonMaxMasterBlocksTick) {
@@ -360,7 +375,7 @@ func TestRunTonScannerCatchupContinuesUntilConfirmedHead(t *testing.T) {
 		cancelAtLookupSeq: 60,
 	}
 	cursor := &tonRuntimeCursor{initialized: true, lastMasterSeqNo: 1}
-	if err := runTonScanner(ctx, api, newTonJettonWalletCache(), cursor); err != nil {
+	if err := runTonScanner(ctx, api, newTonJettonWalletCache(), cursor, mdb.RpcNode{Url: t.Name()}); err != nil {
 		t.Fatalf("runTonScanner(): %v", err)
 	}
 	if len(api.lookups) != 59 {
@@ -487,9 +502,6 @@ func TestProcessTonMasterBlockWithCursorScansSkippedShardBlocks(t *testing.T) {
 	err := processTonMasterBlockWithCursor(context.Background(), api, master, state, newTonJettonWalletCache(), cursor)
 	if err != nil {
 		t.Fatalf("processTonMasterBlockWithCursor(): %v", err)
-	}
-	if len(api.lookupSeqs) != 1 || api.lookupSeqs[0] != 88 {
-		t.Fatalf("lookup shard seqs = %#v, want [88]", api.lookupSeqs)
 	}
 	if len(api.fetchedShardSeqNos) != 2 || api.fetchedShardSeqNos[0] != 88 || api.fetchedShardSeqNos[1] != 89 {
 		t.Fatalf("fetched shard seqs = %#v, want [88 89]", api.fetchedShardSeqNos)

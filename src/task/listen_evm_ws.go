@@ -25,16 +25,31 @@ const (
 // A failed header read must leave the event to confirmed backfill. Local time
 // cannot prove historical ownership and must never enter a durable receipt.
 func processEvmWsTransfer(ctx context.Context, client *ethclient.Client, network, logPrefix string, event types.Log, isWatched evmRecipientCheckerFunc) {
-	if event.Removed || len(event.Topics) < 3 || event.Topics[0] != transferEventHash {
+	if event.Removed || service.ValidateEvmTransferLog(event) != nil || event.TxHash == (common.Hash{}) {
 		return
 	}
 	recipient := common.HexToAddress(event.Topics[2].Hex())
 	if !isWatched(recipient) {
 		return
 	}
+	chain, err := data.GetChainByNetwork(network)
+	if err != nil || chain == nil || !chain.Enabled {
+		return
+	}
+	// The durable backfill retries events that are not confirmed yet. Do not
+	// acknowledge them through a receipt or reserve a hash before that point.
+	confirmCtx, cancel := context.WithTimeout(ctx, evmStatsHeaderTimeout)
+	defer cancel()
+	latest, err := client.HeaderByNumber(confirmCtx, nil)
+	if err != nil || latest == nil || latest.Number == nil || !latest.Number.IsInt64() || event.BlockNumber > uint64(1<<63-1) {
+		return
+	}
+	if int64(event.BlockNumber) > confirmedEvmHead(latest.Number.Int64(), chain.MinConfirmations) {
+		return
+	}
 	header, err := latestEvmBlockHeader(ctx, client, event.BlockNumber)
-	if err == nil && (header == nil || header.Number == nil || header.Number.Cmp(new(big.Int).SetUint64(event.BlockNumber)) != 0 || header.Time == 0 || header.Time > uint64((1<<63-1)/1000)) {
-		err = fmt.Errorf("missing or invalid block header timestamp/number")
+	if err == nil && (header == nil || header.Number == nil || header.Number.Cmp(new(big.Int).SetUint64(event.BlockNumber)) != 0 || header.Time == 0 || header.Time > uint64((1<<63-1)/1000) || header.Hash() != event.BlockHash) {
+		err = fmt.Errorf("missing or invalid block header timestamp/number/hash")
 	}
 	if err != nil {
 		if ctx.Err() == nil {

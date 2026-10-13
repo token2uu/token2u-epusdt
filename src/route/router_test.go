@@ -18,6 +18,7 @@ import (
 	"github.com/GMWalletApp/epusdt/model/dao"
 	"github.com/GMWalletApp/epusdt/model/data"
 	"github.com/GMWalletApp/epusdt/model/mdb"
+	"github.com/GMWalletApp/epusdt/model/request"
 	"github.com/GMWalletApp/epusdt/model/service"
 	"github.com/GMWalletApp/epusdt/telegram"
 	"github.com/GMWalletApp/epusdt/util/constant"
@@ -1846,7 +1847,8 @@ func TestSubmitTxHash_SuccessUpdatesCheckStatus(t *testing.T) {
 	tradeID := createCheckoutCounterRespTestOrder(t, e, "submit-tx-hash-ok-001")
 
 	verified := false
-	restore := service.SetManualOrderPaymentValidatorForTest(func(order *mdb.Orders, blockID string) (string, error) {
+	restore := service.SetManualOrderPaymentValidatorForTest(func(order *mdb.Orders, blockID string, evidence *request.ManualPaymentEvidence) (string, error) {
+		*evidence = manualRouteEvidence(t, order)
 		verified = true
 		if order.TradeId != tradeID {
 			t.Fatalf("validator trade_id = %s, want %s", order.TradeId, tradeID)
@@ -2167,7 +2169,8 @@ func TestSubmitTxHash_VerificationFailureAllowsRetrySameHash(t *testing.T) {
 	tradeID := createCheckoutCounterRespTestOrder(t, e, "submit-tx-hash-retry-001")
 
 	calls := 0
-	restore := service.SetManualOrderPaymentValidatorForTest(func(order *mdb.Orders, blockID string) (string, error) {
+	restore := service.SetManualOrderPaymentValidatorForTest(func(order *mdb.Orders, blockID string, evidence *request.ManualPaymentEvidence) (string, error) {
+		*evidence = manualRouteEvidence(t, order)
 		calls++
 		if order.TradeId != tradeID {
 			t.Fatalf("validator trade_id = %s, want %s", order.TradeId, tradeID)
@@ -2252,7 +2255,7 @@ func TestSubmitTxHash_RejectsExpiredOrderBeforeVerification(t *testing.T) {
 	}
 
 	called := false
-	restore := service.SetManualOrderPaymentValidatorForTest(func(*mdb.Orders, string) (string, error) {
+	restore := service.SetManualOrderPaymentValidatorForTest(func(*mdb.Orders, string, *request.ManualPaymentEvidence) (string, error) {
 		called = true
 		return "canonical-expired-hash", nil
 	})
@@ -2304,7 +2307,7 @@ func TestSubmitTxHash_RejectsOkPayOrder(t *testing.T) {
 	}
 
 	called := false
-	restore := service.SetManualOrderPaymentValidatorForTest(func(*mdb.Orders, string) (string, error) {
+	restore := service.SetManualOrderPaymentValidatorForTest(func(*mdb.Orders, string, *request.ManualPaymentEvidence) (string, error) {
 		called = true
 		return "canonical-okpay-hash", nil
 	})
@@ -2351,7 +2354,7 @@ func TestSubmitTxHash_RejectsExistingHashBeforeRpc(t *testing.T) {
 	tradeID := createCheckoutCounterRespTestOrder(t, e, "submit-tx-hash-existing-001")
 
 	called := false
-	restore := service.SetManualOrderPaymentValidatorForTest(func(*mdb.Orders, string) (string, error) {
+	restore := service.SetManualOrderPaymentValidatorForTest(func(*mdb.Orders, string, *request.ManualPaymentEvidence) (string, error) {
 		called = true
 		return "existing-hash", nil
 	})

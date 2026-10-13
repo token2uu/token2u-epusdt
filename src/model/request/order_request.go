@@ -33,8 +33,20 @@ func (r CreateTransactionRequest) Translates() map[string]string {
 	}
 }
 
+// ManualPaymentEvidence is internal chain evidence for manual payment settlement.
+// It is never populated from a public request body.
+type ManualPaymentEvidence struct {
+	Network, Token, Address string
+	RawAmount               string
+	Decimals                int
+	BlockTimeMs             int64
+	AssetID                 string
+	EventID                 string // scanner-compatible identity of the verified transfer
+}
+
 // OrderProcessingRequest 订单处理
 type OrderProcessingRequest struct {
+	ManualPayment      *ManualPaymentEvidence
 	ReceiveAddress     string
 	Currency           string
 	Token              string

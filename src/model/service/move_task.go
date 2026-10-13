@@ -184,8 +184,8 @@ func EnsureMoveTransferMatchesOrder(order *mdb.Orders, transfer MoveObservedTran
 	if transfer.BlockTimeMs < data.PaymentAssignmentTimeMs(order) {
 		return fmt.Errorf("transaction predates the order")
 	}
-	if !amountMatchesRaw(order.ActualAmount, transfer.RawAmount, transfer.Decimals) {
-		return &AmountMismatchError{ActualPaidAmount: rawAmountToFloat(transfer.RawAmount, transfer.Decimals)}
+	if !manualOrderAmountMatches(order, transfer.RawAmount, transfer.Decimals) {
+		return newAmountMismatch(transfer.RawAmount, transfer.Decimals, transfer.BlockTimeMs, transfer.AssetID, MoveTransferCacheKey(transfer))
 	}
 	return nil
 }

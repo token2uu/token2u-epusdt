@@ -16,6 +16,7 @@ import (
 	addressutil "github.com/GMWalletApp/epusdt/util/address"
 	"github.com/GMWalletApp/epusdt/util/log"
 	"github.com/xssnick/tonutils-go/address"
+	"github.com/xssnick/tonutils-go/tlb"
 	"github.com/xssnick/tonutils-go/ton"
 	"github.com/xssnick/tonutils-go/ton/jetton"
 )
@@ -80,6 +81,13 @@ func StartTonBlockScannerListener() {
 			sleepOrDone(context.Background(), interval)
 			continue
 		}
+		if !cursor.initialized {
+			if err := prepareTonBootstrap(cursor); err != nil {
+				log.Sugar.Errorf("[TON] bootstrap boundary: %v", err)
+				sleepOrDone(context.Background(), tonScannerRetryDelay)
+				continue
+			}
+		}
 		node, ok := resolveTonLiteNode()
 		if !ok {
 			sleepOrDone(context.Background(), interval)
@@ -94,7 +102,7 @@ func StartTonBlockScannerListener() {
 			continue
 		}
 		log.Sugar.Infof("[TON] connected using lite node %s", data.RpcNodeLogLabel(node))
-		err = runTonScanner(context.Background(), api, cache, cursor)
+		err = runTonScanner(context.Background(), api, cache, cursor, node)
 		closeFn()
 		if err != nil {
 			log.Sugar.Warnf("[TON] scanner stopped: %v", err)
@@ -105,7 +113,7 @@ func StartTonBlockScannerListener() {
 	}
 }
 
-func runTonScanner(ctx context.Context, api ton.APIClientWrapped, cache *tonJettonWalletCache, cursor *tonRuntimeCursor) error {
+func runTonScanner(ctx context.Context, api ton.APIClientWrapped, cache *tonJettonWalletCache, cursor *tonRuntimeCursor, node mdb.RpcNode) error {
 	if cursor == nil {
 		cursor = &tonRuntimeCursor{}
 	}
@@ -137,10 +145,21 @@ func runTonScanner(ctx context.Context, api ton.APIClientWrapped, cache *tonJett
 			)
 		}
 
+		if !cursor.initialized {
+			if err := prepareTonBootstrap(cursor); err != nil {
+				return err
+			}
+		}
 		head, err := api.CurrentMasterchainInfo(ctx)
 		if err != nil {
 			data.RecordRpcFailure(mdb.NetworkTon)
 			return fmt.Errorf("current masterchain info: %w", err)
+		}
+		if head == nil {
+			return fmt.Errorf("current masterchain head is nil")
+		}
+		if !data.ObserveRpcPoolHead(node, int64(head.SeqNo)) {
+			return &service.RPCRequestError{Reason: "stale_head"}
 		}
 		confirmedHeadSeqNo := tonConfirmedMasterSeqNo(head.SeqNo, chain.MinConfirmations)
 		data.RecordRpcSuccess(mdb.NetworkTon)
@@ -214,6 +233,21 @@ func tonConfirmedMasterSeqNo(headSeqNo uint32, minConfirmations int) uint32 {
 	return headSeqNo - conf + 1
 }
 
+// Freeze before the first remote call, including repeated connection failures.
+func prepareTonBootstrap(cursor *tonRuntimeCursor) error {
+	if cursor.persistent {
+		saved, err := data.LoadPaymentCursor("ton:master")
+		if err != nil {
+			return err
+		}
+		if saved != "" {
+			return nil
+		}
+	}
+	_, err := data.EnsureNetworkScanStartTime(mdb.NetworkTon, time.Now())
+	return err
+}
+
 func initializeTonRuntimeCursor(ctx context.Context, api ton.APIClientWrapped, head *ton.BlockIDExt, confirmedHeadSeqNo uint32, cursor *tonRuntimeCursor) error {
 	if cursor == nil {
 		return nil
@@ -221,6 +255,7 @@ func initializeTonRuntimeCursor(ctx context.Context, api ton.APIClientWrapped, h
 	if head == nil {
 		return fmt.Errorf("current masterchain head is nil")
 	}
+	hasSaved := false
 	if cursor.persistent {
 		saved, err := data.LoadPaymentCursor("ton:master")
 		if err != nil {
@@ -232,7 +267,36 @@ func initializeTonRuntimeCursor(ctx context.Context, api ton.APIClientWrapped, h
 				return err
 			}
 			confirmedHeadSeqNo = uint32(n)
+			hasSaved = true
 		}
+	}
+	if !hasSaved {
+		start, err := data.EnsureNetworkScanStartTime(mdb.NetworkTon, time.Now())
+		if err != nil {
+			return err
+		}
+		// TON timestamps have second precision; include the entire boundary second.
+		predecessor, err := paymentScanPredecessor(int64(confirmedHeadSeqNo), start.Truncate(time.Second), func(number int64) (int64, error) {
+			block, err := api.WaitForBlock(uint32(number)).LookupBlock(ctx, address.MasterchainID, tonMasterShard, uint32(number))
+			if err != nil {
+				return 0, err
+			}
+			if block == nil || block.SeqNo != uint32(number) || block.Workchain != address.MasterchainID || block.Shard != tonMasterShard {
+				return 0, fmt.Errorf("invalid TON bootstrap block %d", number)
+			}
+			contents, err := api.GetBlockHeader(ctx, block)
+			if err != nil {
+				return 0, err
+			}
+			if contents == nil || contents.SeqNo != uint32(number) {
+				return 0, fmt.Errorf("invalid TON bootstrap block data %d", number)
+			}
+			return int64(contents.GenUtime) * 1000, nil
+		})
+		if err != nil {
+			return fmt.Errorf("locate TON payment scan boundary: %w", err)
+		}
+		confirmedHeadSeqNo = uint32(predecessor)
 	}
 	initMaster := head
 	if confirmedHeadSeqNo > 0 && confirmedHeadSeqNo != head.SeqNo {
@@ -242,8 +306,12 @@ func initializeTonRuntimeCursor(ctx context.Context, api ton.APIClientWrapped, h
 			return fmt.Errorf("lookup initial confirmed masterchain seqno=%d: %w", confirmedHeadSeqNo, err)
 		}
 	}
+	checkpoint := &tonRuntimeCursor{}
 	if confirmedHeadSeqNo > 0 {
-		if err := initializeTonShardCursors(ctx, api, initMaster, cursor); err != nil {
+		if initMaster == nil || initMaster.SeqNo != confirmedHeadSeqNo || initMaster.Workchain != address.MasterchainID || initMaster.Shard != tonMasterShard {
+			return fmt.Errorf("invalid initial TON masterchain block %d", confirmedHeadSeqNo)
+		}
+		if err := initializeTonShardCursors(ctx, api, initMaster, checkpoint); err != nil {
 			return fmt.Errorf("initialize shard cursors masterchain seqno=%d: %w", initMaster.SeqNo, err)
 		}
 	}
@@ -252,6 +320,7 @@ func initializeTonRuntimeCursor(ctx context.Context, api ton.APIClientWrapped, h
 			return err
 		}
 	}
+	cursor.shardSeqNo = checkpoint.shardSeqNo
 	cursor.initialized = true
 	cursor.lastMasterSeqNo = confirmedHeadSeqNo
 	return nil
@@ -319,47 +388,72 @@ func processTonShardBlocksWithCursor(ctx context.Context, api ton.APIClientWrapp
 		return nil
 	}
 	cursor.ensureShardSeqNo()
-	for _, shard := range shards {
-		if shard == nil {
-			continue
+	// Sequence numbers belong to a shard lineage. Splits introduce new keys;
+	// merges can resurrect an old key with a gap containing no such blocks.
+	// Follow proven parent references across gaps instead of inventing numbers.
+	boundaryWorkchains := make(map[string]bool)
+	for checkpoint := range cursor.shardSeqNo {
+		workchain, _, _ := strings.Cut(checkpoint, ":")
+		boundaryWorkchains[workchain] = true
+	}
+	var visit func(*ton.BlockIDExt) error
+	visit = func(block *ton.BlockIDExt) error {
+		if block == nil {
+			return fmt.Errorf("missing shard block")
 		}
-		key := tonShardCursorKey(shard)
-		lastSeqNo, ok := cursor.shardSeqNo[key]
-		if !state.hasWalletInWorkchain(shard.Workchain) {
-			cursor.shardSeqNo[key] = shard.SeqNo
-			continue
+		key := tonShardCursorKey(block)
+		last, known := cursor.shardSeqNo[key]
+		if known && block.SeqNo <= last {
+			return nil
 		}
-
-		start := shard.SeqNo
-		if ok {
-			if shard.SeqNo <= lastSeqNo {
-				continue
+		if !state.hasWalletInWorkchain(block.Workchain) {
+			cursor.shardSeqNo[key] = block.SeqNo
+			return nil
+		}
+		// Empty cursors retain their existing initial-tip behavior. Production
+		// initializes every shard at the persisted masterchain boundary first.
+		hasBoundary := boundaryWorkchains[strconv.FormatInt(int64(block.Workchain), 10)]
+		if hasBoundary && (!known || block.SeqNo != last+1) {
+			// Lightweight header proofs can prune PrevRef in tonutils-go.
+			// Full block data is hash-verified by the SDK and retains both merge
+			// parents, so it cannot silently turn a pruned reference into zero.
+			fullBlock, err := api.WaitForBlock(master.SeqNo).GetBlockData(ctx, block)
+			if err != nil {
+				return fmt.Errorf("load shard ancestry %s seqno=%d: %w", key, block.SeqNo, err)
 			}
-			start = lastSeqNo + 1
-		}
-		if shard.SeqNo > start {
-			log.Sugar.Infof(
-				"[TON] processing shard blocks master_seqno=%d workchain=%d shard=%x from=%d to=%d",
-				master.SeqNo,
-				shard.Workchain,
-				uint64(shard.Shard),
-				start,
-				shard.SeqNo,
-			)
-		}
-		for seq := start; seq <= shard.SeqNo; seq++ {
-			shardBlock := shard
-			if seq != shard.SeqNo {
-				var err error
-				shardBlock, err = api.WaitForBlock(master.SeqNo).LookupBlock(ctx, shard.Workchain, shard.Shard, seq)
-				if err != nil {
-					return fmt.Errorf("lookup shard block workchain=%d shard=%x seqno=%d: %w", shard.Workchain, uint64(shard.Shard), seq, err)
-				}
+			if fullBlock == nil || fullBlock.BlockInfo.SeqNo != block.SeqNo {
+				return fmt.Errorf("invalid shard ancestry header %s seqno=%d", key, block.SeqNo)
 			}
-			if err := processTonShardBlock(ctx, api, master, shardBlock, state, cache); err != nil {
+			header := &fullBlock.BlockInfo
+			wc, shard := tlb.ConvertShardIdentToShard(header.Shard)
+			if wc != block.Workchain || int64(shard) != block.Shard {
+				return fmt.Errorf("shard ancestry header identity mismatch %s", key)
+			}
+			parents, err := ton.GetParentBlocks(header)
+			if err != nil {
 				return err
 			}
-			cursor.shardSeqNo[key] = seq
+			for _, parent := range parents {
+				// Strict descent also rejects cycles and incomplete parent data.
+				if parent == nil || parent.Workchain != block.Workchain || parent.SeqNo >= block.SeqNo {
+					return fmt.Errorf("invalid shard parent %s seqno=%d", key, block.SeqNo)
+				}
+				if err := visit(parent); err != nil {
+					return err
+				}
+			}
+		}
+		if err := processTonShardBlock(ctx, api, master, block, state, cache); err != nil {
+			return err
+		}
+		cursor.shardSeqNo[key] = block.SeqNo
+		return nil
+	}
+	for _, shard := range shards {
+		if shard != nil {
+			if err := visit(shard); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -368,10 +462,28 @@ func processTonShardBlocksWithCursor(ctx context.Context, api ton.APIClientWrapp
 func processTonShardBlock(ctx context.Context, api ton.APIClientWrapped, master, shard *ton.BlockIDExt, state *tonWatchState, cache *tonJettonWalletCache) error {
 	log.Sugar.Debugf("[TON] scanning shard master_seqno=%d workchain=%d shard=%d shard_seqno=%d", master.SeqNo, shard.Workchain, shard.Shard, shard.SeqNo)
 	var after *ton.TransactionID3
+	// A transaction proof does not establish pagination progress. Keep both
+	// account and LT so repeated/cyclic pages fail through the normal retry path.
+	type pageCursor struct {
+		account string
+		lt      uint64
+	}
+	seen := make(map[pageCursor]struct{})
 	for {
 		shorts, incomplete, err := api.WaitForBlock(master.SeqNo).GetBlockTransactionsV2(ctx, shard, tonBlockTxPageSize, after)
 		if err != nil {
 			return err
+		}
+		if len(shorts) == 0 && incomplete {
+			return fmt.Errorf("incomplete transaction page without cursor progress workchain=%d shard=%d seqno=%d", shard.Workchain, shard.Shard, shard.SeqNo)
+		}
+		if len(shorts) > 0 {
+			last := shorts[len(shorts)-1]
+			key := pageCursor{account: string(last.Account), lt: last.LT}
+			if _, repeated := seen[key]; repeated {
+				return fmt.Errorf("repeated transaction page cursor workchain=%d shard=%d seqno=%d lt=%d", shard.Workchain, shard.Shard, shard.SeqNo, last.LT)
+			}
+			seen[key] = struct{}{}
 		}
 		for i := range shorts {
 			account := addressutil.TonAddressFromShortAccount(shard.Workchain, shorts[i].Account)
@@ -417,9 +529,6 @@ func processTonShardBlock(ctx context.Context, api ton.APIClientWrapped, master,
 		}
 		if !incomplete {
 			return nil
-		}
-		if len(shorts) == 0 {
-			return fmt.Errorf("incomplete transaction page without cursor progress workchain=%d shard=%d seqno=%d", shard.Workchain, shard.Shard, shard.SeqNo)
 		}
 		after = shorts[len(shorts)-1].ID3()
 	}

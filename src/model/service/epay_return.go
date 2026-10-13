@@ -156,6 +156,19 @@ func ResolveEPayReturnRedirect(tradeID string) (*EPayReturnRedirect, error) {
 		return nil, err
 	}
 
+	// A channel has its own internal order ID. Merchant identity, return URL,
+	// credentials and final result always belong to the root, even when this
+	// URL was opened through a losing/expired sibling's checkout.
+	if order.ParentTradeId != "" {
+		order, err = GetOrderInfoByTradeId(order.ParentTradeId)
+		if err != nil {
+			return nil, err
+		}
+		if order.ParentTradeId != "" {
+			return nil, constant.OrderStatusConflict
+		}
+	}
+
 	if !isEPayOrder(order) || order.Status != mdb.StatusPaySuccess {
 		return &EPayReturnRedirect{
 			TargetURL: buildCheckoutCounterPath(order.TradeId),

@@ -1,0 +1,30 @@
+package task
+
+// Test overlay entry point: one real scanner round without launching daemon loops.
+import (
+	"context"
+	"fmt"
+	"github.com/GMWalletApp/epusdt/model/mdb"
+	"github.com/GMWalletApp/epusdt/model/service"
+)
+
+func E2EScanNetwork(network, owner string) error {
+	switch network {
+	case mdb.NetworkTron:
+		scanner := NewScanner()
+		if err := scanner.Init(); err != nil {
+			return err
+		}
+		scanner.poll()
+		return nil
+	case mdb.NetworkAptos:
+		state, err := loadMoveWatchState(network)
+		if err != nil {
+			return err
+		}
+		return scanAptosDepositRound(context.Background(), serviceAptosDepositProvider{}, state, 2)
+	case mdb.NetworkSolana:
+		return service.ScanSolanaAddress(owner)
+	}
+	return fmt.Errorf("unsupported network %s", network)
+}

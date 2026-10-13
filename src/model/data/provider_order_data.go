@@ -3,6 +3,7 @@ package data
 import (
 	"github.com/GMWalletApp/epusdt/model/dao"
 	"github.com/GMWalletApp/epusdt/model/mdb"
+	"github.com/GMWalletApp/epusdt/util/constant"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 )
@@ -41,20 +42,30 @@ func UpdateProviderOrderCreated(tradeID string, provider string, providerOrderID
 }
 
 func UpdateProviderOrderCreatedWithTransaction(tx *gorm.DB, tradeID string, provider string, providerOrderID string, payURL string) error {
-	return tx.Model(&mdb.ProviderOrder{}).
+	result := tx.Model(&mdb.ProviderOrder{}).
 		Where("trade_id = ?", tradeID).
 		Where("provider = ?", provider).
+		Where("provider_order_id = '' OR provider_order_id = ?", providerOrderID).
+		Where("status IN ?", []string{mdb.ProviderOrderStatusCreating, mdb.ProviderOrderStatusFailed, mdb.ProviderOrderStatusPending, mdb.ProviderOrderStatusPaid}).
 		Updates(map[string]interface{}{
 			"provider_order_id": providerOrderID,
 			"pay_url":           payURL,
-			"status":            mdb.ProviderOrderStatusPending,
-		}).Error
+			"status":            gorm.Expr("CASE WHEN status = ? THEN status ELSE ? END", mdb.ProviderOrderStatusPaid, mdb.ProviderOrderStatusPending),
+		})
+	if result.Error != nil {
+		return result.Error
+	}
+	if result.RowsAffected != 1 {
+		return constant.OrderStatusConflict
+	}
+	return nil
 }
 
 func MarkProviderOrderFailed(tradeID string, provider string) error {
 	return dao.Mdb.Model(&mdb.ProviderOrder{}).
 		Where("trade_id = ?", tradeID).
 		Where("provider = ?", provider).
+		Where("status = ?", mdb.ProviderOrderStatusCreating).
 		Update("status", mdb.ProviderOrderStatusFailed).Error
 }
 
@@ -79,7 +90,7 @@ func MarkProviderOrderExpired(tradeID string, provider string) error {
 	return dao.Mdb.Model(&mdb.ProviderOrder{}).
 		Where("trade_id = ?", tradeID).
 		Where("provider = ?", provider).
-		Where("status IN ?", []string{mdb.ProviderOrderStatusCreating, mdb.ProviderOrderStatusPending}).
+		Where("status IN ?", []string{mdb.ProviderOrderStatusCreating, mdb.ProviderOrderStatusPending, mdb.ProviderOrderStatusFailed}).
 		Update("status", mdb.ProviderOrderStatusExpired).Error
 }
 

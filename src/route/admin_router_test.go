@@ -18,6 +18,7 @@ import (
 	"github.com/GMWalletApp/epusdt/model/dao"
 	"github.com/GMWalletApp/epusdt/model/data"
 	"github.com/GMWalletApp/epusdt/model/mdb"
+	"github.com/GMWalletApp/epusdt/model/request"
 	"github.com/GMWalletApp/epusdt/model/service"
 	"github.com/GMWalletApp/epusdt/util/constant"
 	"github.com/GMWalletApp/epusdt/util/http_client"
@@ -840,7 +841,8 @@ func TestAdminOrders_MarkPaidSuccessAfterVerification(t *testing.T) {
 	}
 
 	verified := false
-	restore := service.SetManualOrderPaymentValidatorForTest(func(got *mdb.Orders, blockID string) (string, error) {
+	restore := service.SetManualOrderPaymentValidatorForTest(func(got *mdb.Orders, blockID string, evidence *request.ManualPaymentEvidence) (string, error) {
+		*evidence = manualRouteEvidence(t, got)
 		verified = true
 		if got.TradeId != order.TradeId {
 			t.Fatalf("validator trade_id = %s, want %s", got.TradeId, order.TradeId)
@@ -901,7 +903,8 @@ func TestAdminOrders_MarkPaidExpiredOrderAfterVerification(t *testing.T) {
 	}
 
 	verified := false
-	restore := service.SetManualOrderPaymentValidatorForTest(func(got *mdb.Orders, blockID string) (string, error) {
+	restore := service.SetManualOrderPaymentValidatorForTest(func(got *mdb.Orders, blockID string, evidence *request.ManualPaymentEvidence) (string, error) {
+		*evidence = manualRouteEvidence(t, got)
 		verified = true
 		if got.TradeId != order.TradeId {
 			t.Fatalf("validator trade_id = %s, want %s", got.TradeId, order.TradeId)
@@ -991,7 +994,8 @@ func TestAdminOrders_MarkPaidExpiredSubOrderAfterVerification(t *testing.T) {
 		t.Fatalf("create sibling order: %v", err)
 	}
 
-	restore := service.SetManualOrderPaymentValidatorForTest(func(got *mdb.Orders, blockID string) (string, error) {
+	restore := service.SetManualOrderPaymentValidatorForTest(func(got *mdb.Orders, blockID string, evidence *request.ManualPaymentEvidence) (string, error) {
+		*evidence = manualRouteEvidence(t, got)
 		if got.TradeId != sub.TradeId {
 			t.Fatalf("validator trade_id = %s, want %s", got.TradeId, sub.TradeId)
 		}
@@ -1063,7 +1067,7 @@ func TestAdminOrders_MarkPaidRejectsVerificationFailure(t *testing.T) {
 	if err := dao.Mdb.Create(order).Error; err != nil {
 		t.Fatalf("create order: %v", err)
 	}
-	restore := service.SetManualOrderPaymentValidatorForTest(func(*mdb.Orders, string) (string, error) {
+	restore := service.SetManualOrderPaymentValidatorForTest(func(*mdb.Orders, string, *request.ManualPaymentEvidence) (string, error) {
 		return "", errors.New("transaction amount mismatch")
 	})
 	defer restore()
@@ -1103,7 +1107,7 @@ func TestAdminOrders_MarkPaidRejectsNonOnChainOrder(t *testing.T) {
 		t.Fatalf("create order: %v", err)
 	}
 	called := false
-	restore := service.SetManualOrderPaymentValidatorForTest(func(*mdb.Orders, string) (string, error) {
+	restore := service.SetManualOrderPaymentValidatorForTest(func(*mdb.Orders, string, *request.ManualPaymentEvidence) (string, error) {
 		called = true
 		return "block-admin-provider", nil
 	})

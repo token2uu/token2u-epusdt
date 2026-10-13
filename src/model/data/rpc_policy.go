@@ -59,6 +59,16 @@ func RpcEndpointCoolingDown(node mdb.RpcNode) bool {
 // only fed real chain/indexer heads, never an idle wallet's signature cursor.
 // requestStarted is the HTTP dispatch time after local rate-limit admission.
 func ObserveRpcHead(node mdb.RpcNode, head int64, requestStarted time.Time) bool {
+	return observeRpcHead(node, head, requestStarted, false)
+}
+
+// A pool can rotate among servers at slightly different heights. Such a lower
+// response is not an immediate failure, but must not refresh the progress age.
+func ObserveRpcPoolHead(node mdb.RpcNode, head int64) bool {
+	return observeRpcHead(node, head, time.Time{}, true)
+}
+
+func observeRpcHead(node mdb.RpcNode, head int64, requestStarted time.Time, allowRegression bool) bool {
 	rpcEndpointPolicy.Lock()
 	defer rpcEndpointPolicy.Unlock()
 	key, now := rpcEndpointKey(node), rpcEndpointPolicy.now()
@@ -76,7 +86,7 @@ func ObserveRpcHead(node mdb.RpcNode, head int64, requestStarted time.Time) bool
 	// an older snapshot. Accept it without rewinding the high-water mark or
 	// refreshing its age; the caller still validates its own required range.
 	overlappedAdvance := !requestStarted.IsZero() && requestStarted.Before(state.advanced)
-	return (head >= state.head || overlappedAdvance) && now.Sub(state.advanced) < time.Duration(seconds)*time.Second
+	return (allowRegression || head >= state.head || overlappedAdvance) && now.Sub(state.advanced) < time.Duration(seconds)*time.Second
 }
 
 func ResetRpcEndpointPolicyForTest() {

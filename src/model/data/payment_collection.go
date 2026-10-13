@@ -1,7 +1,6 @@
 package data
 
 import (
-	"crypto/sha256"
 	"errors"
 	"fmt"
 	"math/big"
@@ -37,6 +36,11 @@ func PaymentAssetID(network, asset string) string {
 // placeholders update=true fills the original order without changing CreatedAt.
 func CreateExclusivePayment(order *mdb.Orders, token mdb.ChainToken, wallets []mdb.WalletAddress, update bool) error {
 	if order == nil || order.ActualAmount <= 0 || order.Amount <= 0 || order.PaymentExpiresAt == nil || token.Decimals < 0 || token.Decimals > 36 {
+		return constant.PayAmountErr
+	}
+	// The displayed amount must be payable under the same minimum snapshot
+	// used for settlement. Reject before allocating a slot or updating a parent.
+	if decimal.NewFromFloat(order.ActualAmount).LessThan(decimal.NewFromFloat(token.MinAmount)) {
 		return constant.PayAmountErr
 	}
 	CollectionMu.Lock()
@@ -209,7 +213,7 @@ func closeExclusiveTx(tx *gorm.DB, order mdb.Orders, now time.Time, notify bool)
 			return err
 		}
 		if item.PayProvider != "" && item.PayProvider != mdb.PaymentProviderOnChain {
-			if err := tx.Model(&mdb.ProviderOrder{}).Where("trade_id = ? AND provider = ? AND status IN ?", item.TradeId, item.PayProvider, []string{mdb.ProviderOrderStatusCreating, mdb.ProviderOrderStatusPending}).Update("status", mdb.ProviderOrderStatusExpired).Error; err != nil {
+			if err := tx.Model(&mdb.ProviderOrder{}).Where("trade_id = ? AND provider = ? AND status IN ?", item.TradeId, item.PayProvider, []string{mdb.ProviderOrderStatusCreating, mdb.ProviderOrderStatusPending, mdb.ProviderOrderStatusFailed}).Update("status", mdb.ProviderOrderStatusExpired).Error; err != nil {
 				return err
 			}
 		}
@@ -274,6 +278,7 @@ func ProcessExclusivePaymentWithResult(p ObservedPayment) (handled bool, settled
 		return false, nil, nil
 	}
 	p.Network = normalizeLockNetwork(p.Network)
+	p.TxHash = CanonicalPaymentTransactionID(p.Network, p.TxHash)
 	p.Address = normalizeLockAddress(p.Network, p.Address)
 	p.Token = normalizeLockToken(p.Token)
 	p.AssetID = PaymentAssetID(p.Network, p.AssetID)
@@ -304,7 +309,7 @@ func ProcessExclusivePaymentWithResult(p ObservedPayment) (handled bool, settled
 			}
 		}
 		handled = true
-		key := fmt.Sprintf("%x", sha256.Sum256([]byte(p.Network+"\x00"+p.TxHash+"\x00"+p.EventID)))
+		key := paymentEventKey(p.Network, p.TxHash, p.EventID)
 		var existing mdb.PaymentReceipt
 		if err := tx.Where("event_key = ?", key).Find(&existing).Error; err != nil {
 			return err
@@ -418,6 +423,16 @@ func ProcessExclusivePaymentWithResult(p ObservedPayment) (handled bool, settled
 			receipt.Reason = "below_settlement_precision"
 			return persist()
 		}
+		if existing.ID == 0 {
+			claimed, err := PaymentEventAlreadyClaimed(tx, p.Network, p.TxHash, p.EventID)
+			if err != nil {
+				return err
+			}
+			if claimed {
+				receipt.Reason = "duplicate_payment"
+				return persist()
+			}
+		}
 		if err := settleObservedPaymentTx(tx, order, root, paid, amount.String(), p.TxHash, now); err != nil {
 			return err
 		}
@@ -482,7 +497,7 @@ func settleObservedPaymentTx(tx *gorm.DB, order, root *mdb.Orders, paid decimal.
 			}
 		}
 		if item.TradeId != order.TradeId && item.PayProvider != "" && item.PayProvider != mdb.PaymentProviderOnChain {
-			if err := tx.Model(&mdb.ProviderOrder{}).Where("trade_id = ? AND provider = ? AND status IN ?", item.TradeId, item.PayProvider, []string{mdb.ProviderOrderStatusCreating, mdb.ProviderOrderStatusPending}).Update("status", mdb.ProviderOrderStatusExpired).Error; err != nil {
+			if err := tx.Model(&mdb.ProviderOrder{}).Where("trade_id = ? AND provider = ? AND status IN ?", item.TradeId, item.PayProvider, []string{mdb.ProviderOrderStatusCreating, mdb.ProviderOrderStatusPending, mdb.ProviderOrderStatusFailed}).Update("status", mdb.ProviderOrderStatusExpired).Error; err != nil {
 				return err
 			}
 		}

@@ -1,5 +1,10 @@
 # Review
 
+> Current payment readiness assessment (2026-10-13): see
+> [Payment flow review and release checklist](docs/payment-flow-review.md).
+> That review covers the current working tree and supersedes the payment release
+> conclusions below. The remainder of this file is the earlier runtime review.
+
 ## Scope
 
 This review checks `dev-runtime` against `dev` with the following standards:

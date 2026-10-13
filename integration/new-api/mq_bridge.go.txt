@@ -1,0 +1,11 @@
+package mq
+
+// Included by the integration overlay only; never in a production build.
+func E2EExpireOrders() { processExpiredOrders() }
+func E2ECallback(tradeID string) {
+	if callbackLimiter == nil {
+		callbackLimiter = make(chan struct{}, 1)
+	}
+	callbackLimiter <- struct{}{}
+	processCallback(tradeID)
+}

@@ -15,8 +15,10 @@ import (
 	"time"
 
 	tron "github.com/GMWalletApp/epusdt/crypto"
+	"github.com/GMWalletApp/epusdt/model/dao"
 	"github.com/GMWalletApp/epusdt/model/data"
 	"github.com/GMWalletApp/epusdt/model/mdb"
+	"github.com/GMWalletApp/epusdt/model/request"
 	addressutil "github.com/GMWalletApp/epusdt/util/address"
 	"github.com/GMWalletApp/epusdt/util/constant"
 	"github.com/GMWalletApp/epusdt/util/math"
@@ -40,12 +42,13 @@ var (
 	manualOrderPaymentValidator   manualOrderPaymentValidatorFunc = validateManualOrderPaymentDefault
 )
 
-type manualOrderPaymentValidatorFunc func(*mdb.Orders, string) (string, error)
+type manualOrderPaymentValidatorFunc func(*mdb.Orders, string, ...*request.ManualPaymentEvidence) (string, error)
 
 // ManualPaymentValidationResult contains the result of manual payment validation.
 type ManualPaymentValidationResult struct {
 	CanonicalTxID string
-	PaidAmount    float64 // actual crypto amount paid, 0 if exact match
+	PaidAmount    float64                        // actual crypto amount paid, 0 if exact match
+	Evidence      *request.ManualPaymentEvidence // verified chain evidence for every successful payment
 }
 
 // ValidateManualOrderPayment verifies that the supplied chain transaction
@@ -61,11 +64,20 @@ func ValidateManualOrderPayment(order *mdb.Orders, blockTransactionID string) (s
 // ValidateManualOrderPaymentWithPaidAmount verifies the transaction and returns
 // both the canonical tx ID and the actual paid amount (for EPay orders with amount mismatch).
 func ValidateManualOrderPaymentWithPaidAmount(order *mdb.Orders, blockTransactionID string) (*ManualPaymentValidationResult, error) {
-	canonicalTxID, err := ValidateManualOrderPayment(order, blockTransactionID)
+	manualOrderPaymentValidatorMu.Lock()
+	validator := manualOrderPaymentValidator
+	manualOrderPaymentValidatorMu.Unlock()
+	evidence := &request.ManualPaymentEvidence{}
+	canonicalTxID, err := validator(order, blockTransactionID, evidence)
 	if err == nil {
+		if evidence.RawAmount == "" || evidence.BlockTimeMs <= 0 {
+			return nil, fmt.Errorf("verified payment evidence missing")
+		}
+		evidence.Network, evidence.Token, evidence.Address = order.Network, order.Token, order.ReceiveAddress
 		return &ManualPaymentValidationResult{
 			CanonicalTxID: canonicalTxID,
 			PaidAmount:    0,
+			Evidence:      evidence,
 		}, nil
 	}
 
@@ -82,9 +94,30 @@ func ValidateManualOrderPaymentWithPaidAmount(order *mdb.Orders, blockTransactio
 		return nil, err
 
 	case isEpay:
+		// Zero is also the legacy exact-match sentinel. A mismatch must carry
+		// positive raw evidence so it cannot be interpreted as full payment.
+		if mismatchErr.Evidence == nil || mismatchErr.ActualPaidAmount <= 0 {
+			return nil, fmt.Errorf("non-positive or missing verified payment amount")
+		}
+		raw, ok := new(big.Int).SetString(mismatchErr.Evidence.RawAmount, 10)
+		if !ok || raw.Sign() <= 0 || mismatchErr.Evidence.BlockTimeMs <= 0 {
+			return nil, fmt.Errorf("invalid verified payment evidence")
+		}
+		// The verifier must return the identity from the verified chain evidence,
+		// even when only the amount differs. Never fall back to the user's spelling.
+		if canonicalTxID == "" {
+			return nil, fmt.Errorf("verified payment identity missing")
+		}
+		evidence := *mismatchErr.Evidence
+		evidence.Network, evidence.Token, evidence.Address = order.Network, order.Token, order.ReceiveAddress
+		canonicalTxID = data.CanonicalPaymentTransactionID(order.Network, canonicalTxID)
+		if err := ensureManualBlockTransactionUnused(order, canonicalTxID, mismatchErr.Evidence.EventID); err != nil {
+			return nil, err
+		}
 		return &ManualPaymentValidationResult{
-			CanonicalTxID: strings.TrimSpace(blockTransactionID),
+			CanonicalTxID: canonicalTxID,
 			PaidAmount:    mismatchErr.ActualPaidAmount,
+			Evidence:      &evidence,
 		}, nil
 
 	default:
@@ -94,14 +127,18 @@ func ValidateManualOrderPaymentWithPaidAmount(order *mdb.Orders, blockTransactio
 
 // SetManualOrderPaymentValidatorForTest swaps the chain verifier in tests so
 // route/controller tests don't depend on public RPC availability.
-func SetManualOrderPaymentValidatorForTest(fn func(*mdb.Orders, string) (string, error)) func() {
+func SetManualOrderPaymentValidatorForTest(fn func(*mdb.Orders, string, *request.ManualPaymentEvidence) (string, error)) func() {
 	manualOrderPaymentValidatorMu.Lock()
 	old := manualOrderPaymentValidator
 	if fn == nil {
 		manualOrderPaymentValidator = validateManualOrderPaymentDefault
 	} else {
-		manualOrderPaymentValidator = func(order *mdb.Orders, blockTransactionID string) (string, error) {
-			return fn(order, blockTransactionID)
+		manualOrderPaymentValidator = func(order *mdb.Orders, blockTransactionID string, evidence ...*request.ManualPaymentEvidence) (string, error) {
+			sink := &request.ManualPaymentEvidence{}
+			if len(evidence) > 0 {
+				sink = evidence[0]
+			}
+			return fn(order, blockTransactionID, sink)
 		}
 	}
 	manualOrderPaymentValidatorMu.Unlock()
@@ -112,7 +149,10 @@ func SetManualOrderPaymentValidatorForTest(fn func(*mdb.Orders, string) (string,
 	}
 }
 
-func validateManualOrderPaymentDefault(order *mdb.Orders, blockTransactionID string) (string, error) {
+func validateManualOrderPaymentDefault(order *mdb.Orders, blockTransactionID string, evidence ...*request.ManualPaymentEvidence) (string, error) {
+	if len(evidence) == 0 || evidence[0] == nil {
+		evidence = []*request.ManualPaymentEvidence{{}}
+	}
 	if order == nil || order.ID == 0 {
 		return "", fmt.Errorf("order not found")
 	}
@@ -125,96 +165,45 @@ func validateManualOrderPaymentDefault(order *mdb.Orders, blockTransactionID str
 	var err error
 	switch strings.ToLower(strings.TrimSpace(order.Network)) {
 	case mdb.NetworkTron:
-		canonicalTxID, err = validateManualTronPayment(order, txID)
+		canonicalTxID, err = validateManualTronPayment(order, txID, evidence...)
 	case mdb.NetworkSolana:
-		canonicalTxID, err = validateManualSolanaPayment(order, txID)
+		canonicalTxID, err = validateManualSolanaPayment(order, txID, evidence...)
 	case mdb.NetworkTon:
-		canonicalTxID, err = validateManualTonPayment(order, txID)
+		canonicalTxID, err = validateManualTonPayment(order, txID, evidence...)
 	case mdb.NetworkAptos:
-		canonicalTxID, err = ValidateManualAptosPayment(order, txID)
+		canonicalTxID, err = ValidateManualAptosPayment(order, txID, evidence...)
 	case mdb.NetworkEthereum, mdb.NetworkBsc, mdb.NetworkPolygon, mdb.NetworkPlasma:
-		canonicalTxID, err = validateManualEvmPayment(order, txID)
+		canonicalTxID, err = validateManualEvmPayment(order, txID, evidence...)
 	default:
 		return "", fmt.Errorf("unsupported manual payment verification network: %s", order.Network)
 	}
 	if err != nil {
-		return "", err
+		return canonicalTxID, err
 	}
-	if err = ensureManualBlockTransactionUnused(order, canonicalTxID); err != nil {
+	if err = ensureManualBlockTransactionUnused(order, canonicalTxID, evidence[0].EventID); err != nil {
 		return "", err
 	}
 	return canonicalTxID, nil
 }
 
-func ensureManualBlockTransactionUnused(order *mdb.Orders, canonicalTxID string) error {
-	candidates := equivalentManualBlockTransactionIDs(order.Network, canonicalTxID)
-	var existing *mdb.Orders
-	var err error
-	if manualBlockTransactionIDIsHex(order.Network) {
-		existing, err = data.GetOrderByBlockTransactionIDsCaseInsensitive(candidates)
-	} else {
-		existing, err = data.GetOrderByBlockTransactionIDs(candidates)
+func ensureManualBlockTransactionUnused(order *mdb.Orders, canonicalTxID string, eventIDs ...string) error {
+	eventID := ""
+	if len(eventIDs) > 0 {
+		eventID = eventIDs[0]
 	}
+	data.CollectionMu.Lock()
+	claimed, err := data.PaymentEventAlreadyClaimed(dao.Mdb, order.Network, canonicalTxID, eventID)
+	data.CollectionMu.Unlock()
 	if err != nil {
 		return err
 	}
-	if existing.ID > 0 && existing.ID != order.ID {
+	if claimed {
 		return constant.OrderBlockAlreadyProcess
 	}
 	return nil
 }
 
-func manualBlockTransactionIDIsHex(network string) bool {
-	switch strings.ToLower(strings.TrimSpace(network)) {
-	case mdb.NetworkTron, mdb.NetworkEthereum, mdb.NetworkBsc, mdb.NetworkPolygon, mdb.NetworkPlasma, mdb.NetworkAptos:
-		return true
-	default:
-		return false
-	}
-}
-
-func equivalentManualBlockTransactionIDs(network, canonicalTxID string) []string {
-	network = strings.ToLower(strings.TrimSpace(network))
-	canonicalTxID = strings.TrimSpace(canonicalTxID)
-	seen := make(map[string]struct{})
-	out := make([]string, 0, 6)
-	add := func(value string) {
-		value = strings.TrimSpace(value)
-		if value == "" {
-			return
-		}
-		if _, ok := seen[value]; ok {
-			return
-		}
-		seen[value] = struct{}{}
-		out = append(out, value)
-	}
-
-	add(canonicalTxID)
-	switch network {
-	case mdb.NetworkEthereum, mdb.NetworkBsc, mdb.NetworkPolygon, mdb.NetworkPlasma, mdb.NetworkAptos:
-		body := strings.TrimPrefix(strings.TrimPrefix(canonicalTxID, "0x"), "0X")
-		body = strings.ToLower(body)
-		add("0x" + body)
-		add("0x" + strings.ToUpper(body))
-		add("0X" + body)
-		add("0X" + strings.ToUpper(body))
-		add(body)
-		add(strings.ToUpper(body))
-	case mdb.NetworkTron:
-		body := strings.TrimPrefix(strings.TrimPrefix(canonicalTxID, "0x"), "0X")
-		body = strings.ToLower(body)
-		add(body)
-		add(strings.ToUpper(body))
-		add("0x" + body)
-		add("0x" + strings.ToUpper(body))
-		add("0X" + body)
-		add("0X" + strings.ToUpper(body))
-	}
-	return out
-}
-
-func validateManualEvmPayment(order *mdb.Orders, txID string) (string, error) {
+func validateManualEvmPayment(order *mdb.Orders, txID string, evidence ...*request.ManualPaymentEvidence) (string, error) {
 	txHash, canonicalTxID, err := canonicalEvmHash(txID)
 	if err != nil {
 		return "", err
@@ -237,8 +226,8 @@ func validateManualEvmPayment(order *mdb.Orders, txID string) (string, error) {
 	}
 	defer closeManualEvmClients(clients)
 
-	if err = validateManualEvmPaymentAcrossClients(ctx, clients, order, txHash, token); err != nil {
-		return "", err
+	if err = validateManualEvmPaymentAcrossClients(ctx, clients, order, txHash, token, evidence...); err != nil {
+		return canonicalTxID, err
 	}
 	return canonicalTxID, nil
 }
@@ -262,11 +251,11 @@ func closeManualEvmClients(clients []manualEvmClient) {
 	}
 }
 
-func validateManualEvmPaymentAcrossClients(ctx context.Context, clients []manualEvmClient, order *mdb.Orders, txHash common.Hash, token *mdb.ChainToken) error {
+func validateManualEvmPaymentAcrossClients(ctx context.Context, clients []manualEvmClient, order *mdb.Orders, txHash common.Hash, token *mdb.ChainToken, evidence ...*request.ManualPaymentEvidence) error {
 	var verifyErrors []string
 	var mismatchErr *AmountMismatchError
 	for _, item := range clients {
-		if err := validateManualEvmPaymentWithClient(ctx, item.reader, order, txHash, token); err != nil {
+		if err := validateManualEvmPaymentWithClient(ctx, item.reader, order, txHash, token, evidence...); err != nil {
 			if mismatchErr == nil {
 				errors.As(err, &mismatchErr)
 			}
@@ -284,20 +273,27 @@ func validateManualEvmPaymentAcrossClients(ctx context.Context, clients []manual
 	return fmt.Errorf("no enabled %s WS/HTTP RPC node configured", order.Network)
 }
 
-func validateManualEvmPaymentWithClient(ctx context.Context, client evmChainReader, order *mdb.Orders, txHash common.Hash, token *mdb.ChainToken) error {
+func validateManualEvmPaymentWithClient(ctx context.Context, client evmChainReader, order *mdb.Orders, txHash common.Hash, token *mdb.ChainToken, evidence ...*request.ManualPaymentEvidence) error {
 	receipt, err := client.TransactionReceipt(ctx, txHash)
 	if err != nil {
 		return fmt.Errorf("fetch transaction receipt: %w", err)
 	}
+	if receipt == nil || receipt.TxHash != txHash || receipt.BlockHash == (common.Hash{}) {
+		return fmt.Errorf("transaction receipt identity does not match request")
+	}
 	if receipt.Status != types.ReceiptStatusSuccessful {
 		return fmt.Errorf("transaction is not successful")
 	}
-	if receipt.BlockNumber == nil {
-		return fmt.Errorf("transaction receipt missing block number")
+	if receipt.BlockNumber == nil || !receipt.BlockNumber.IsUint64() {
+		return fmt.Errorf("transaction receipt missing or invalid block number")
 	}
 	txHeader, err := client.HeaderByNumber(ctx, receipt.BlockNumber)
 	if err != nil {
 		return fmt.Errorf("fetch transaction block header: %w", err)
+	}
+	if txHeader == nil || txHeader.Number == nil || txHeader.Number.Cmp(receipt.BlockNumber) != 0 ||
+		txHeader.Hash() != receipt.BlockHash || txHeader.Time == 0 || txHeader.Time > uint64((1<<63-1)/1000) {
+		return fmt.Errorf("transaction receipt does not match canonical block header")
 	}
 	if err = ensureEvmTransactionNotBeforeOrder(txHeader.Time, order); err != nil {
 		return err
@@ -314,28 +310,33 @@ func validateManualEvmPaymentWithClient(ctx context.Context, client evmChainRead
 	if err != nil {
 		return fmt.Errorf("invalid order receive address: %w", err)
 	}
-	amountMismatch := false
-	var mismatchedAmount float64
+	var mismatch *AmountMismatchError
 	for _, item := range receipt.Logs {
 		if item == nil || !strings.EqualFold(item.Address.Hex(), contract.Hex()) {
 			continue
 		}
-		if len(item.Topics) < 3 || item.Topics[0] != erc20TransferEventHash {
+		if len(item.Topics) == 0 || item.Topics[0] != erc20TransferEventHash {
 			continue
+		}
+		if err := ValidateEvmTransferLog(*item); err != nil {
+			return err
 		}
 		if !strings.EqualFold(common.BytesToAddress(item.Topics[2].Bytes()).Hex(), to.Hex()) {
 			continue
 		}
+		if item.Removed || item.TxHash != txHash || item.BlockHash != receipt.BlockHash || item.BlockNumber != receipt.BlockNumber.Uint64() {
+			return fmt.Errorf("transfer log does not match transaction receipt")
+		}
 		rawAmount := new(big.Int).SetBytes(item.Data)
-		if amountMatchesRaw(order.ActualAmount, rawAmount, token.Decimals) {
+		if manualOrderAmountMatches(order, rawAmount, token.Decimals) {
+			captureManualEvidence(evidence, rawAmount, token.Decimals, int64(txHeader.Time)*1000, token.ContractAddress, fmt.Sprintf("log:%d", item.Index))
 			return nil
 		}
-		amountMismatch = true
-		mismatchedAmount = rawAmountToFloat(rawAmount, token.Decimals)
+		mismatch = newAmountMismatch(rawAmount, token.Decimals, int64(txHeader.Time)*1000, token.ContractAddress, fmt.Sprintf("log:%d", item.Index))
 	}
 
-	if amountMismatch {
-		return &AmountMismatchError{ActualPaidAmount: mismatchedAmount}
+	if mismatch != nil {
+		return mismatch
 	}
 	return fmt.Errorf("matching token transfer to order address not found")
 }
@@ -419,7 +420,7 @@ func ensureEvmTransactionNotBeforeOrder(blockTime uint64, order *mdb.Orders) err
 	if order == nil {
 		return fmt.Errorf("order not found")
 	}
-	if int64(blockTime)*1000 < order.CreatedAt.TimestampMilli() {
+	if int64(blockTime)*1000 < data.PaymentAssignmentTimeMs(order) {
 		return fmt.Errorf("transaction predates the order")
 	}
 	return nil
@@ -437,6 +438,9 @@ func ensureEvmConfirmations(ctx context.Context, client evmChainReader, network 
 	header, err := client.HeaderByNumber(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("fetch latest block: %w", err)
+	}
+	if header == nil || header.Number == nil || !header.Number.IsUint64() {
+		return fmt.Errorf("latest block has no valid number")
 	}
 	confirmations := new(big.Int).Sub(header.Number, txBlock)
 	confirmations.Add(confirmations, big.NewInt(1))
@@ -496,7 +500,7 @@ type manualTronTransferContractValue struct {
 	Amount       int64  `json:"amount"`
 }
 
-func validateManualTronPayment(order *mdb.Orders, txID string) (string, error) {
+func validateManualTronPayment(order *mdb.Orders, txID string, evidence ...*request.ManualPaymentEvidence) (string, error) {
 	normalizedTxID, err := normalizeTronTxID(txID)
 	if err != nil {
 		return "", err
@@ -511,15 +515,22 @@ func validateManualTronPayment(order *mdb.Orders, txID string) (string, error) {
 	}
 
 	var verifyErrors []string
+	var mismatchErr *AmountMismatchError
 	for _, node := range nodes {
 		if strings.TrimSpace(node.Url) == "" {
 			continue
 		}
-		if err = validateManualTronPaymentWithNode(order, normalizedTxID, node); err != nil {
+		if err = validateManualTronPaymentWithNode(order, normalizedTxID, node, evidence...); err != nil {
+			if mismatchErr == nil {
+				errors.As(err, &mismatchErr)
+			}
 			verifyErrors = append(verifyErrors, fmt.Sprintf("%s: %v", manualRpcNodeLabel(node), err))
 			continue
 		}
 		return normalizedTxID, nil
+	}
+	if mismatchErr != nil {
+		return normalizedTxID, mismatchErr
 	}
 	if len(verifyErrors) > 0 {
 		return "", fmt.Errorf("manual TRON verification failed: %s", strings.Join(verifyErrors, "; "))
@@ -527,16 +538,13 @@ func validateManualTronPayment(order *mdb.Orders, txID string) (string, error) {
 	return "", fmt.Errorf("no enabled %s %s RPC node configured in rpc_nodes", mdb.NetworkTron, mdb.RpcNodeTypeHttp)
 }
 
-func validateManualTronPaymentWithNode(order *mdb.Orders, normalizedTxID string, node mdb.RpcNode) error {
+func validateManualTronPaymentWithNode(order *mdb.Orders, normalizedTxID string, node mdb.RpcNode, evidence ...*request.ManualPaymentEvidence) error {
 	baseURL := strings.TrimSpace(node.Url)
 	var tx manualTronTransaction
 	if err := tronPostJSON(baseURL, node.ApiKey, "/wallet/gettransactionbyid", map[string]interface{}{"value": normalizedTxID}, &tx); err != nil {
 		return fmt.Errorf("fetch tron transaction: %w", err)
 	}
-	if strings.TrimSpace(tx.TxID) == "" {
-		return fmt.Errorf("transaction not found")
-	}
-	if strings.TrimSpace(tx.TxID) != "" && !strings.EqualFold(strings.TrimSpace(tx.TxID), normalizedTxID) {
+	if returnedID, err := normalizeTronTxID(tx.TxID); err != nil || returnedID != normalizedTxID {
 		return fmt.Errorf("transaction id mismatch")
 	}
 	if len(tx.Ret) > 0 && tx.Ret[0].ContractRet != "" && tx.Ret[0].ContractRet != "SUCCESS" {
@@ -546,6 +554,9 @@ func validateManualTronPaymentWithNode(order *mdb.Orders, normalizedTxID string,
 	var info manualTronTxInfo
 	if err := tronPostJSON(baseURL, node.ApiKey, "/wallet/gettransactioninfobyid", map[string]interface{}{"value": normalizedTxID}, &info); err != nil {
 		return fmt.Errorf("fetch tron transaction info: %w", err)
+	}
+	if returnedID, err := normalizeTronTxID(info.ID); err != nil || returnedID != normalizedTxID {
+		return fmt.Errorf("transaction info id mismatch")
 	}
 	if info.BlockNumber <= 0 {
 		return fmt.Errorf("transaction is not confirmed")
@@ -559,23 +570,20 @@ func validateManualTronPaymentWithNode(order *mdb.Orders, normalizedTxID string,
 	if info.BlockTimeStamp <= 0 {
 		return fmt.Errorf("transaction block timestamp missing")
 	}
-	if info.BlockTimeStamp < order.CreatedAt.TimestampMilli() {
+	if info.BlockTimeStamp < data.PaymentAssignmentTimeMs(order) {
 		return fmt.Errorf("transaction predates the order")
 	}
 
 	if strings.EqualFold(strings.TrimSpace(order.Token), "TRX") {
-		if err := validateManualTronNativeTransfer(order, &tx); err != nil {
-			return err
-		}
-		return nil
+		return validateManualTronNativeTransfer(order, &tx, info.BlockTimeStamp, evidence...)
 	}
-	if err := validateManualTronTRC20Transfer(order, &tx, &info); err != nil {
+	if err := validateManualTronTRC20Transfer(order, &tx, &info, evidence...); err != nil {
 		return err
 	}
 	return nil
 }
 
-func validateManualTronNativeTransfer(order *mdb.Orders, tx *manualTronTransaction) error {
+func validateManualTronNativeTransfer(order *mdb.Orders, tx *manualTronTransaction, blockTimeMs int64, evidence ...*request.ManualPaymentEvidence) error {
 	if len(tx.RawData.Contract) == 0 || tx.RawData.Contract[0].Type != "TransferContract" {
 		return fmt.Errorf("transaction is not a TRX transfer")
 	}
@@ -590,13 +598,14 @@ func validateManualTronNativeTransfer(order *mdb.Orders, tx *manualTronTransacti
 	if !strings.EqualFold(toAddr, order.ReceiveAddress) {
 		return fmt.Errorf("transaction recipient mismatch")
 	}
-	if !amountMatchesRaw(order.ActualAmount, big.NewInt(val.Amount), 6) {
-		return &AmountMismatchError{ActualPaidAmount: rawAmountToFloat(big.NewInt(val.Amount), 6)}
+	if !manualOrderAmountMatches(order, big.NewInt(val.Amount), 6) {
+		return newAmountMismatch(big.NewInt(val.Amount), 6, blockTimeMs, "")
 	}
+	captureManualEvidence(evidence, big.NewInt(val.Amount), 6, blockTimeMs, "")
 	return nil
 }
 
-func validateManualTronTRC20Transfer(order *mdb.Orders, tx *manualTronTransaction, info *manualTronTxInfo) error {
+func validateManualTronTRC20Transfer(order *mdb.Orders, tx *manualTronTransaction, info *manualTronTxInfo, evidence ...*request.ManualPaymentEvidence) error {
 	token, err := data.GetEnabledChainTokenBySymbol(mdb.NetworkTron, order.Token)
 	if err != nil {
 		return err
@@ -611,10 +620,10 @@ func validateManualTronTRC20Transfer(order *mdb.Orders, tx *manualTronTransactio
 	if err != nil {
 		return fmt.Errorf("invalid configured TRC20 contract: %w", err)
 	}
-	return validateManualTronTRC20TransferEvent(order, info, contractHex, token.Decimals)
+	return validateManualTronTRC20TransferEvent(order, info, contractHex, token.Decimals, evidence...)
 }
 
-func validateManualTronTRC20TransferEvent(order *mdb.Orders, info *manualTronTxInfo, contractHex string, decimals int) error {
+func validateManualTronTRC20TransferEvent(order *mdb.Orders, info *manualTronTxInfo, contractHex string, decimals int, evidence ...*request.ManualPaymentEvidence) error {
 	if info == nil || len(info.Log) == 0 {
 		return fmt.Errorf("matching TRC20 transfer event to order address not found")
 	}
@@ -623,8 +632,11 @@ func validateManualTronTRC20TransferEvent(order *mdb.Orders, info *manualTronTxI
 		return fmt.Errorf("invalid order receive address: %w", err)
 	}
 	transferTopic := strings.TrimPrefix(erc20TransferEventHash.Hex(), "0x")
-	amountMismatch := false
-	var mismatchedAmount float64
+	asset, err := tronHexToAddress(contractHex)
+	if err != nil {
+		return err
+	}
+	var mismatch *AmountMismatchError
 	for _, event := range info.Log {
 		eventContractHex, err := normalizeTronAddressHex(event.Address)
 		if err != nil || eventContractHex != contractHex {
@@ -641,14 +653,14 @@ func validateManualTronTRC20TransferEvent(order *mdb.Orders, info *manualTronTxI
 		if err != nil {
 			return fmt.Errorf("invalid TRC20 transfer event amount: %w", err)
 		}
-		if amountMatchesRaw(order.ActualAmount, rawAmount, decimals) {
+		if manualOrderAmountMatches(order, rawAmount, decimals) {
+			captureManualEvidence(evidence, rawAmount, decimals, info.BlockTimeStamp, asset)
 			return nil
 		}
-		amountMismatch = true
-		mismatchedAmount = rawAmountToFloat(rawAmount, decimals)
+		mismatch = newAmountMismatch(rawAmount, decimals, info.BlockTimeStamp, asset)
 	}
-	if amountMismatch {
-		return &AmountMismatchError{ActualPaidAmount: mismatchedAmount}
+	if mismatch != nil {
+		return mismatch
 	}
 	return fmt.Errorf("matching TRC20 transfer event to order address not found")
 }
@@ -704,7 +716,7 @@ type manualTonTxRef struct {
 	HasLT      bool
 }
 
-func validateManualTonPayment(order *mdb.Orders, txID string) (string, error) {
+func validateManualTonPayment(order *mdb.Orders, txID string, evidence ...*request.ManualPaymentEvidence) (string, error) {
 	ref, err := parseManualTonTxRef(txID)
 	if err != nil {
 		return "", err
@@ -727,17 +739,20 @@ func validateManualTonPayment(order *mdb.Orders, txID string) (string, error) {
 
 	var verifyErrors []string
 	var mismatchErr *AmountMismatchError
+	var mismatchID string
 	for _, node := range nodes {
 		api, closeFn, err := dialManualTonClient(node)
 		if err != nil {
 			verifyErrors = append(verifyErrors, fmt.Sprintf("%s: connect: %v", manualRpcNodeLabel(node), err))
 			continue
 		}
-		canonicalID, err := validateManualTonPaymentWithAPI(context.Background(), api, order, orderAddr.Address, ref)
+		canonicalID, err := validateManualTonPaymentWithAPI(context.Background(), api, order, orderAddr.Address, ref, evidence...)
 		closeFn()
 		if err != nil {
 			if mismatchErr == nil {
-				errors.As(err, &mismatchErr)
+				if errors.As(err, &mismatchErr) {
+					mismatchID = canonicalID
+				}
 			}
 			verifyErrors = append(verifyErrors, fmt.Sprintf("%s: %v", manualRpcNodeLabel(node), err))
 			continue
@@ -745,7 +760,7 @@ func validateManualTonPayment(order *mdb.Orders, txID string) (string, error) {
 		return canonicalID, nil
 	}
 	if mismatchErr != nil {
-		return "", mismatchErr
+		return mismatchID, mismatchErr
 	}
 	if len(verifyErrors) > 0 {
 		return "", fmt.Errorf("manual TON verification failed: %s", strings.Join(verifyErrors, "; "))
@@ -833,7 +848,7 @@ func dialManualTonClient(node mdb.RpcNode) (ton.APIClientWrapped, func(), error)
 	return ConnectTonLiteAPI(ctx, node.Url, manualVerifyRequestTimeout, 3)
 }
 
-func validateManualTonPaymentWithAPI(ctx context.Context, api ton.APIClientWrapped, order *mdb.Orders, receive *address.Address, ref manualTonTxRef) (string, error) {
+func validateManualTonPaymentWithAPI(ctx context.Context, api ton.APIClientWrapped, order *mdb.Orders, receive *address.Address, ref manualTonTxRef, evidence ...*request.ManualPaymentEvidence) (string, error) {
 	master, err := api.CurrentMasterchainInfo(ctx)
 	if err != nil {
 		return "", fmt.Errorf("fetch current masterchain: %w", err)
@@ -850,14 +865,15 @@ func validateManualTonPaymentWithAPI(ctx context.Context, api ton.APIClientWrapp
 	if err != nil {
 		return "", err
 	}
-	return validateManualTonPaymentCandidates(order, receive, ref, txs, state)
+	return validateManualTonPaymentCandidates(order, receive, ref, txs, state, evidence...)
 }
 
-func validateManualTonPaymentCandidates(order *mdb.Orders, receive *address.Address, ref manualTonTxRef, txs []*tlb.Transaction, state *manualTonState) (string, error) {
+func validateManualTonPaymentCandidates(order *mdb.Orders, receive *address.Address, ref manualTonTxRef, txs []*tlb.Transaction, state *manualTonState, evidence ...*request.ManualPaymentEvidence) (string, error) {
 	if state == nil {
 		state = &manualTonState{jettonWallets: make(map[string]mdb.ChainToken)}
 	}
 	var matched []*TonObservedTransfer
+	var amountErrors []error
 	for _, tx := range txs {
 		if tx == nil {
 			continue
@@ -873,10 +889,13 @@ func validateManualTonPaymentCandidates(order *mdb.Orders, receive *address.Addr
 		if err != nil || transfer == nil {
 			continue
 		}
-		if err = EnsureTonTransferMatchesOrder(order, transfer); err != nil {
+		err = EnsureTonTransferMatchesOrder(order, transfer)
+		var mismatch *AmountMismatchError
+		if err != nil && !errors.As(err, &mismatch) {
 			return "", err
 		}
 		matched = append(matched, transfer)
+		amountErrors = append(amountErrors, err)
 	}
 	if len(matched) == 0 {
 		return "", fmt.Errorf("matching ton transfer to order address not found")
@@ -884,8 +903,14 @@ func validateManualTonPaymentCandidates(order *mdb.Orders, receive *address.Addr
 	if len(matched) > 1 && !ref.HasLT {
 		return "", fmt.Errorf("ton transaction hash matched multiple recent transactions; submit canonical id or lt:hash")
 	}
+	if amountErrors[0] == nil {
+		captureManualEvidence(evidence, matched[0].RawAmount, matched[0].Token.Decimals, matched[0].BlockTimeMs, matched[0].Token.ContractAddress, fmt.Sprintf("inbound:%d", matched[0].LT))
+	}
+	if mismatch, ok := amountErrors[0].(*AmountMismatchError); ok {
+		mismatch.Evidence.EventID = fmt.Sprintf("inbound:%d", matched[0].LT)
+	}
 	receiveRaw := addressutil.TonRawAddressObjectKey(receive)
-	return TonCanonicalBlockTransactionID(receiveRaw, matched[0].LT, matched[0].TxHashHex), nil
+	return TonCanonicalBlockTransactionID(receiveRaw, matched[0].LT, matched[0].TxHashHex), amountErrors[0]
 }
 
 func listManualTonCandidateTransactions(ctx context.Context, api ton.APIClientWrapped, master *ton.BlockIDExt, receive *address.Address, ref manualTonTxRef) ([]*tlb.Transaction, error) {
@@ -943,7 +968,7 @@ func manualTonTokenState(ctx context.Context, api ton.APIClientWrapped, master *
 	return state, nil
 }
 
-func validateManualSolanaPayment(order *mdb.Orders, sig string) (string, error) {
+func validateManualSolanaPayment(order *mdb.Orders, sig string, evidence ...*request.ManualPaymentEvidence) (string, error) {
 	sig = strings.TrimSpace(sig)
 	nodes, err := data.ListManualPaymentRpcCandidates(mdb.NetworkSolana, mdb.RpcNodeTypeHttp)
 	if err != nil {
@@ -960,7 +985,7 @@ func validateManualSolanaPayment(order *mdb.Orders, sig string) (string, error) 
 		if rpcURL == "" {
 			continue
 		}
-		if err = validateManualSolanaPaymentWithRPC(order, sig, node); err != nil {
+		if err = validateManualSolanaPaymentWithRPC(order, sig, node, evidence...); err != nil {
 			if mismatchErr == nil {
 				errors.As(err, &mismatchErr)
 			}
@@ -970,7 +995,7 @@ func validateManualSolanaPayment(order *mdb.Orders, sig string) (string, error) 
 		return sig, nil
 	}
 	if mismatchErr != nil {
-		return "", mismatchErr
+		return sig, mismatchErr
 	}
 	if len(verifyErrors) > 0 {
 		return "", fmt.Errorf("manual Solana verification failed: %s", strings.Join(verifyErrors, "; "))
@@ -978,16 +1003,15 @@ func validateManualSolanaPayment(order *mdb.Orders, sig string) (string, error) 
 	return "", fmt.Errorf("no enabled %s %s RPC node configured in rpc_nodes", mdb.NetworkSolana, mdb.RpcNodeTypeHttp)
 }
 
-func validateManualSolanaPaymentWithRPC(order *mdb.Orders, sig string, node mdb.RpcNode) error {
-	rpcURL := strings.TrimSpace(node.Url)
-	txData, err := solGetTransactionWithURL(rpcURL, sig)
+func validateManualSolanaPaymentWithRPC(order *mdb.Orders, sig string, node mdb.RpcNode, evidence ...*request.ManualPaymentEvidence) error {
+	txData, err := solGetTransactionWithNodeHeaders(node, sig, nil)
 	if err != nil {
 		return fmt.Errorf("fetch solana transaction: %w", err)
 	}
 	if !gjson.GetBytes(txData, "result").Exists() || gjson.GetBytes(txData, "result").Type == gjson.Null {
 		return fmt.Errorf("transaction not found")
 	}
-	if err = ensureSolanaConfirmationsWithRPC(order.Network, sig, rpcURL); err != nil {
+	if err = ensureSolanaConfirmationsWithNode(order.Network, sig, node); err != nil {
 		return err
 	}
 
@@ -1009,32 +1033,46 @@ func validateManualSolanaPaymentWithRPC(order *mdb.Orders, sig string, node mdb.
 		}
 	}
 
-	instructions := gjson.GetBytes(txData, "result.transaction.message.instructions").Array()
-	amountMismatch := false
-	var mismatchedAmount float64
-	for _, instruction := range instructions {
-		transferInfo, parseErr := ParseTransferInfoFromInstruction(instruction, txData)
-		if parseErr != nil || transferInfo == nil {
+	watched := []string{order.ReceiveAddress}
+	for mint := range mintTokens {
+		ata, err := FindATAAddress(order.ReceiveAddress, mint)
+		if err != nil {
+			return err
+		}
+		watched = append(watched, ata)
+	}
+	transfers, err := validateSolTransactionTransfers(txData, sig, watched, mintTokens)
+	if err != nil {
+		return err
+	}
+	var mismatch *AmountMismatchError
+	for index, transferInfo := range transfers {
+		if transferInfo == nil {
 			continue
 		}
 		if !isTransferToAddress(transferInfo, order.ReceiveAddress) {
 			continue
 		}
-		token, amount := resolveSolTokenAndAmount(transferInfo, mintTokens, nativeSolToken)
+		token, _ := resolveSolTokenAndAmount(transferInfo, mintTokens, nativeSolToken)
 		if !strings.EqualFold(token, order.Token) {
 			continue
 		}
 		if err = ensureSolanaTransferNotBeforeOrder(transferInfo.BlockTime, order); err != nil {
 			return err
 		}
-		if amountMatchesFloat(order.ActualAmount, amount) {
+		cfg := mintTokens[transferInfo.Mint]
+		asset := transferInfo.Mint
+		if asset == "SOL" {
+			cfg, asset = nativeSolToken, ""
+		}
+		if manualOrderAmountMatches(order, new(big.Int).SetUint64(transferInfo.RawAmount), cfg.Decimals) {
+			captureManualEvidence(evidence, new(big.Int).SetUint64(transferInfo.RawAmount), cfg.Decimals, transferInfo.BlockTime*1000, asset, fmt.Sprintf("instruction:%d", index))
 			return nil
 		}
-		amountMismatch = true
-		mismatchedAmount = amount
+		mismatch = newAmountMismatch(new(big.Int).SetUint64(transferInfo.RawAmount), cfg.Decimals, transferInfo.BlockTime*1000, asset, fmt.Sprintf("instruction:%d", index))
 	}
-	if amountMismatch {
-		return &AmountMismatchError{ActualPaidAmount: mismatchedAmount}
+	if mismatch != nil {
+		return mismatch
 	}
 	return fmt.Errorf("matching solana transfer to order address not found")
 }
@@ -1046,21 +1084,25 @@ func ensureSolanaTransferNotBeforeOrder(blockTime int64, order *mdb.Orders) erro
 	if blockTime <= 0 {
 		return fmt.Errorf("transaction block time missing")
 	}
-	if blockTime*1000 < order.CreatedAt.TimestampMilli() {
+	if blockTime*1000 < data.PaymentAssignmentTimeMs(order) {
 		return fmt.Errorf("transaction predates the order")
 	}
 	return nil
 }
 
 func ensureSolanaConfirmations(network, sig string) error {
-	rpcURL, err := resolveSolanaRpcURL()
+	node, err := resolveSolanaRpcNode()
 	if err != nil {
 		return err
 	}
-	return ensureSolanaConfirmationsWithRPC(network, sig, rpcURL)
+	return ensureSolanaConfirmationsWithNode(network, sig, *node)
 }
 
 func ensureSolanaConfirmationsWithRPC(network, sig string, rpcURL string) error {
+	return ensureSolanaConfirmationsWithNode(network, sig, mdb.RpcNode{Network: network, Type: mdb.RpcNodeTypeHttp, Url: rpcURL})
+}
+
+func ensureSolanaConfirmationsWithNode(network, sig string, node mdb.RpcNode) error {
 	chain, err := data.GetChainByNetwork(network)
 	if err != nil {
 		return err
@@ -1073,10 +1115,10 @@ func ensureSolanaConfirmationsWithRPC(network, sig string, rpcURL string) error 
 		return nil
 	}
 
-	body, err := solRetryClientWithURL(rpcURL, "getSignatureStatuses", []interface{}{
+	body, err := solRetryClientWithNodeHeaders(node, "getSignatureStatuses", []interface{}{
 		[]string{sig},
 		map[string]interface{}{"searchTransactionHistory": true},
-	})
+	}, nil)
 	if err != nil {
 		return fmt.Errorf("fetch solana signature status: %w", err)
 	}
@@ -1134,6 +1176,18 @@ func rawAmountToFloat(rawAmount *big.Int, decimals int) float64 {
 // that callers (e.g. package EPay tolerance) can decide whether to accept.
 type AmountMismatchError struct {
 	ActualPaidAmount float64
+	Evidence         *request.ManualPaymentEvidence
+}
+
+func newAmountMismatch(raw *big.Int, decimals int, stamp int64, asset string, eventIDs ...string) *AmountMismatchError {
+	if raw == nil {
+		return &AmountMismatchError{}
+	}
+	proof := &request.ManualPaymentEvidence{RawAmount: raw.String(), Decimals: decimals, BlockTimeMs: stamp, AssetID: asset}
+	if len(eventIDs) > 0 {
+		proof.EventID = eventIDs[0]
+	}
+	return &AmountMismatchError{ActualPaidAmount: rawAmountToFloat(raw, decimals), Evidence: proof}
 }
 
 func (e *AmountMismatchError) Error() string {
@@ -1271,4 +1325,28 @@ func normalizeEvmAddress(value string) (common.Address, error) {
 		return common.Address{}, err
 	}
 	return common.HexToAddress("0x" + value), nil
+}
+
+// Capture only an accepted exact transfer. Failed node attempts must not provide
+// settlement evidence; amount-mismatch errors carry their own selected evidence.
+func captureManualEvidence(sinks []*request.ManualPaymentEvidence, raw *big.Int, decimals int, stamp int64, asset string, eventIDs ...string) {
+	if len(sinks) > 0 && sinks[0] != nil && raw != nil {
+		*sinks[0] = request.ManualPaymentEvidence{RawAmount: raw.String(), Decimals: decimals, BlockTimeMs: stamp, AssetID: asset}
+		if len(eventIDs) > 0 {
+			sinks[0].EventID = eventIDs[0]
+		}
+	}
+}
+
+// New orders keep the amount precision used when their address was reserved.
+// An administrator changing the global precision must not change an old quote.
+func manualOrderAmountMatches(order *mdb.Orders, raw *big.Int, decimals int) bool {
+	if order.AmountPrecision == nil {
+		return amountMatchesRaw(order.ActualAmount, raw, decimals)
+	}
+	if raw == nil || raw.Sign() <= 0 || decimals < 0 || decimals > 36 {
+		return false
+	}
+	precision := int32(data.NormalizeAmountPrecision(*order.AmountPrecision))
+	return decimal.NewFromFloat(order.ActualAmount).Round(precision).Equal(decimal.NewFromBigInt(raw, -int32(decimals)).Round(precision))
 }

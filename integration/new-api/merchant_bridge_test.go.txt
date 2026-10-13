@@ -1,0 +1,77 @@
+package controller
+
+// Loaded into the real merchant controller package with Go's -overlay flag.
+// These endpoints only exist in this isolated test process.
+import (
+	"errors"
+	"gorm.io/gorm"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/QuantumNous/new-api/common"
+	"github.com/QuantumNous/new-api/model"
+	"github.com/QuantumNous/new-api/setting/operation_setting"
+	"github.com/QuantumNous/new-api/setting/system_setting"
+	"github.com/gin-gonic/gin"
+	"github.com/stretchr/testify/require"
+)
+
+func TestEpusdtMerchantBridge(t *testing.T) {
+	if os.Getenv("EPUSDT_E2E_GATEWAY") == "" {
+		t.Skip("isolated gateway required")
+	}
+	t.Setenv("SQL_DSN", "")
+	t.Setenv("LOG_SQL_DSN", "")
+	common.SQLitePath = filepath.Join(t.TempDir(), "init.db")
+	common.IsMasterNode = false
+	require.NoError(t, model.InitDB())
+	initDB, err := model.DB.DB()
+	require.NoError(t, err)
+	require.NoError(t, initDB.Close())
+	db := setupEpayNotifyTest(t)
+	user := createEpayTestUser(t)
+	operation_setting.PayAddress = os.Getenv("EPUSDT_E2E_GATEWAY") + "/payments/epay/v1/order/create-transaction"
+	operation_setting.EpayKey = "test-token"
+	operation_setting.Price = 1
+	operation_setting.PayMethods = []map[string]string{{"type": "usdt.tron"}, {"type": "usdt.aptos"}, {"type": "usdt.solana"}}
+	operation_setting.CustomCallbackAddress = "http://93.184.216.34"
+	system_setting.ServerAddress = "http://93.184.216.34"
+	var failCredit atomic.Bool
+	require.NoError(t, db.Callback().Update().Before("gorm:update").Register("e2e_credit_failure", func(tx *gorm.DB) {
+		if tx.Statement.Table == "users" && failCredit.CompareAndSwap(true, false) {
+			tx.AddError(errors.New("injected credit failure"))
+		}
+	}))
+	r := gin.New()
+	r.POST("/test/fail-credit", func(c *gin.Context) { failCredit.Store(true); c.Status(200) })
+	r.POST("/test/create", func(c *gin.Context) { c.Set("id", user.Id); RequestEpay(c) })
+	r.Any("/api/user/epay/notify", EpayNotify)
+	r.GET("/test/state", func(c *gin.Context) {
+		var orders []model.TopUp
+		if err := db.Where("user_id = ?", user.Id).Order("id").Find(&orders).Error; err != nil {
+			c.String(500, "%v", err)
+			return
+		}
+		var fresh model.User
+		if err := db.First(&fresh, user.Id).Error; err != nil {
+			c.String(500, "%v", err)
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"quota": fresh.Quota, "quota_per_unit": common.QuotaPerUnit, "orders": orders})
+	})
+	stopped := make(chan struct{}, 1)
+	r.POST("/test/stop", func(c *gin.Context) { c.Status(200); stopped <- struct{}{} })
+	server := httptest.NewServer(r)
+	defer server.Close()
+	require.NoError(t, os.WriteFile(os.Getenv("EPUSDT_E2E_READY"), []byte(server.URL), 0600))
+	select {
+	case <-stopped:
+	case <-time.After(90 * time.Second):
+		t.Fatal("gateway did not finish")
+	}
+}

@@ -532,9 +532,22 @@ func solRetryClientWithURL(rpcUrl string, method string, params []interface{}) (
 }
 
 func solRetryClientWithURLHeaders(rpcUrl string, method string, params []interface{}, headers http.Header) ([]byte, error) {
-	rpcUrl = strings.TrimSpace(rpcUrl)
-	return solHistoryBackoff.do(rpcUrl, method, params, headers, func() ([]byte, error) {
-		return solRequestWithURLHeaders(rpcUrl, method, params, headers)
+	return solRetryClientWithNodeHeaders(mdb.RpcNode{Network: mdb.NetworkSolana, Type: mdb.RpcNodeTypeHttp, Url: rpcUrl}, method, params, headers)
+}
+
+func solRetryClientWithNodeHeaders(node mdb.RpcNode, method string, params []interface{}, headers http.Header) ([]byte, error) {
+	node.Url = strings.TrimSpace(node.Url)
+	// Authentication must also participate in the history backoff identity.
+	// Keep the full node for transport accounting and paid/public rate limits.
+	headers = headers.Clone()
+	if headers == nil {
+		headers = make(http.Header)
+	}
+	if node.ApiKey != "" && headers.Get("Authorization") == "" {
+		headers.Set("Authorization", "Bearer "+node.ApiKey)
+	}
+	return solHistoryBackoff.do(node.Url, method, params, headers, func() ([]byte, error) {
+		return solRequestWithNode(node, method, params, headers, "", false)
 	})
 }
 
@@ -721,7 +734,11 @@ func solGetTransactionWithURL(rpcURL string, sig string) ([]byte, error) {
 }
 
 func solGetTransactionWithURLHeaders(rpcURL string, sig string, headers http.Header) ([]byte, error) {
-	txData, err := solRetryClientWithURLHeaders(rpcURL, "getTransaction", []interface{}{
+	return solGetTransactionWithNodeHeaders(mdb.RpcNode{Network: mdb.NetworkSolana, Type: mdb.RpcNodeTypeHttp, Url: rpcURL}, sig, headers)
+}
+
+func solGetTransactionWithNodeHeaders(node mdb.RpcNode, sig string, headers http.Header) ([]byte, error) {
+	txData, err := solRetryClientWithNodeHeaders(node, "getTransaction", []interface{}{
 		sig,
 		map[string]interface{}{
 			"encoding":                       "jsonParsed",

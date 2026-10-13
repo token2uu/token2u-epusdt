@@ -404,44 +404,43 @@ func NewScanner() *Scanner {
 }
 
 func (s *Scanner) Init() error {
-	node, err := service.ResolveTronRpcNode()
-	if err != nil {
-		return fmt.Errorf("resolve tron node: %w", err)
-	}
-	s.useRpcNode(node)
-
-	log.Sugar.Infof("[TRON-BLOCK] using RPC node %s", s.nodeLabel)
-	block, err := s.fetchBlock(nil)
-	if err != nil {
-
-		return fmt.Errorf("获取初始块失败: %w", err)
-	}
-	s.lastBlock = block.BlockHeader.RawData.Number
 	saved, err := data.LoadPaymentCursor("tron:blocks")
 	if err != nil {
 		return err
 	}
 	if saved != "" {
 		s.lastBlock, err = strconv.ParseInt(saved, 10, 64)
-		if err != nil {
-			return fmt.Errorf("invalid tron cursor: %w", err)
+		if err != nil || s.lastBlock < 0 {
+			return fmt.Errorf("invalid tron cursor %q", saved)
 		}
-	} else {
-		// Start behind the confirmation window so initialization cannot skip
-		// newly assigned payments awaiting confirmation.
-		if chain, err := data.GetChainByNetwork(mdb.NetworkTron); err != nil {
-			return err
-		} else if chain != nil {
-			s.lastBlock -= int64(chain.MinConfirmations)
-		}
-		if s.lastBlock < 0 {
-			s.lastBlock = 0
-		}
-		if err := data.SavePaymentCursor("tron:blocks", strconv.FormatInt(s.lastBlock, 10)); err != nil {
-			return err
-		}
+		return nil
 	}
-	log.Sugar.Infof("[TRON-BLOCK] start block=%d", s.lastBlock)
+	start, err := data.EnsureNetworkScanStartTime(mdb.NetworkTron, time.Now())
+	if err != nil {
+		return err
+	}
+	block, err := s.fetchBlock(nil)
+	if err != nil {
+		return fmt.Errorf("获取初始块失败: %w", err)
+	}
+	predecessor, err := paymentScanPredecessor(block.BlockHeader.RawData.Number, start, func(number int64) (int64, error) {
+		if number == block.BlockHeader.RawData.Number {
+			return block.BlockHeader.RawData.Timestamp, nil
+		}
+		historical, err := s.fetchBlock(&number)
+		if err != nil {
+			return 0, err
+		}
+		return historical.BlockHeader.RawData.Timestamp, nil
+	})
+	if err != nil {
+		return fmt.Errorf("locate TRON payment scan boundary: %w", err)
+	}
+	if err := data.SavePaymentCursor("tron:blocks", strconv.FormatInt(predecessor, 10)); err != nil {
+		return err
+	}
+	s.lastBlock = predecessor
+	log.Sugar.Infof("[TRON-BLOCK] start block=%d payment_boundary=%s", s.lastBlock, start.UTC().Format(time.RFC3339Nano))
 	return nil
 }
 

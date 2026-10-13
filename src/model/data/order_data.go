@@ -175,56 +175,6 @@ func GetOrderByBlockIdWithTransaction(tx *gorm.DB, blockID string) (*mdb.Orders,
 	return order, err
 }
 
-// GetOrderByBlockTransactionIDs fetches the first order whose stored tx id
-// matches any equivalent spelling supplied by the caller.
-func GetOrderByBlockTransactionIDs(blockIDs []string) (*mdb.Orders, error) {
-	order := new(mdb.Orders)
-	seen := make(map[string]struct{}, len(blockIDs))
-	candidates := make([]string, 0, len(blockIDs))
-	for _, blockID := range blockIDs {
-		blockID = strings.TrimSpace(blockID)
-		if blockID == "" {
-			continue
-		}
-		if _, ok := seen[blockID]; ok {
-			continue
-		}
-		seen[blockID] = struct{}{}
-		candidates = append(candidates, blockID)
-	}
-	if len(candidates) == 0 {
-		return order, nil
-	}
-	err := dao.Mdb.Model(order).Where("block_transaction_id IN ?", candidates).Limit(1).Find(order).Error
-	return order, err
-}
-
-// GetOrderByBlockTransactionIDsCaseInsensitive fetches the first order whose
-// stored tx id matches any candidate after ASCII case folding. This is used
-// only for hex-based chain tx ids; case-sensitive signatures must keep using
-// GetOrderByBlockTransactionIDs.
-func GetOrderByBlockTransactionIDsCaseInsensitive(blockIDs []string) (*mdb.Orders, error) {
-	order := new(mdb.Orders)
-	seen := make(map[string]struct{}, len(blockIDs))
-	candidates := make([]string, 0, len(blockIDs))
-	for _, blockID := range blockIDs {
-		blockID = strings.ToLower(strings.TrimSpace(blockID))
-		if blockID == "" {
-			continue
-		}
-		if _, ok := seen[blockID]; ok {
-			continue
-		}
-		seen[blockID] = struct{}{}
-		candidates = append(candidates, blockID)
-	}
-	if len(candidates) == 0 {
-		return order, nil
-	}
-	err := dao.Mdb.Model(order).Where("LOWER(block_transaction_id) IN ?", candidates).Limit(1).Find(order).Error
-	return order, err
-}
-
 // SettleOrderGroupWithTransaction commits legacy payment, parent callback and
 // sibling closure together. A failed parent write must roll back the child too.
 // Callers serialize settlement with CollectionMu and release runtime locks only
@@ -234,7 +184,26 @@ func SettleOrderGroupWithTransaction(tx *gorm.DB, req *request.OrderProcessingRe
 	if err := tx.Where("trade_id = ?", req.TradeId).First(&order).Error; err != nil {
 		return nil, err
 	}
-	existing, err := GetOrderByBlockIdWithTransaction(tx, req.BlockTransactionId)
+	txID := req.BlockTransactionId
+	var existing *mdb.Orders
+	var err error
+	if order.PayProvider == "" || order.PayProvider == mdb.PaymentProviderOnChain {
+		txID = CanonicalPaymentTransactionID(order.Network, txID)
+		eventID := ""
+		if req.ManualPayment != nil {
+			eventID = req.ManualPayment.EventID
+		}
+		claimed, claimErr := PaymentEventAlreadyClaimed(tx, order.Network, txID, eventID)
+		if claimErr != nil {
+			return nil, claimErr
+		}
+		if claimed {
+			return nil, constant.OrderBlockAlreadyProcess
+		}
+		existing = &mdb.Orders{}
+	} else {
+		existing, err = GetOrderByBlockIdWithTransaction(tx, txID)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -279,21 +248,42 @@ func SettleOrderGroupWithTransaction(tx *gorm.DB, req *request.OrderProcessingRe
 		}
 	}
 	paid := decimal.Zero
-	if req.PaidAmount > 0 && req.PaidAmount != order.ActualAmount {
+	crypto := decimal.NewFromFloat(req.Amount)
+	if req.PaidAmount > 0 {
+		crypto = decimal.NewFromFloat(req.PaidAmount)
+	}
+	if req.ManualPayment != nil {
+		var err error
+		crypto, err = manualPaymentAmount(tx, &order, req.ManualPayment)
+		if err != nil {
+			return nil, err
+		}
+	}
+	amountMatched := crypto.Equal(decimal.NewFromFloat(order.ActualAmount))
+	if req.ManualPayment != nil {
+		amountMatched = historicalAmountMatches(&order, crypto)
+	}
+	if (req.PaidAmount > 0 || req.ManualPayment != nil) && !amountMatched {
 		if order.ActualAmount <= 0 || order.Amount <= 0 {
 			return nil, fmt.Errorf("invalid settlement amount")
 		}
-		paid = decimal.NewFromFloat(req.PaidAmount).Mul(decimal.NewFromFloat(order.Amount)).Div(decimal.NewFromFloat(order.ActualAmount)).Round(2)
+		paid = crypto.Mul(decimal.NewFromFloat(order.Amount)).Div(decimal.NewFromFloat(order.ActualAmount)).Round(2)
 		if !paid.IsPositive() {
 			return nil, fmt.Errorf("payment below settlement precision")
 		}
 	}
-	crypto := req.Amount
-	if req.PaidAmount > 0 {
-		crypto = req.PaidAmount
-	}
-	if err := settleObservedPaymentTx(tx, &order, root, paid, decimal.NewFromFloat(crypto).String(), req.BlockTransactionId, time.Now()); err != nil {
+	if err := settleObservedPaymentTx(tx, &order, root, paid, crypto.String(), txID, time.Now()); err != nil {
 		return nil, err
+	}
+	if proof := req.ManualPayment; proof != nil && proof.EventID != "" {
+		receipt := mdb.PaymentReceipt{EventKey: paymentEventKey(order.Network, txID, proof.EventID),
+			Network: normalizeLockNetwork(order.Network), Address: normalizeLockAddress(order.Network, order.ReceiveAddress), Token: normalizeLockToken(order.Token),
+			AssetID: PaymentAssetID(order.Network, proof.AssetID), TxHash: txID, EventID: proof.EventID,
+			RawAmount: proof.RawAmount, Decimals: proof.Decimals, Amount: crypto.String(), BlockTimeMs: proof.BlockTimeMs,
+			TradeID: order.TradeId, ParentTradeID: order.ParentTradeId, Status: "settled"}
+		if err := tx.Create(&receipt).Error; err != nil {
+			return nil, err
+		}
 	}
 	var group []mdb.Orders
 	err = tx.Where("trade_id = ? OR parent_trade_id = ?", root.TradeId, root.TradeId).Find(&group).Error
@@ -367,9 +357,42 @@ func OrderSuccessWithPaidAmount(tx *gorm.DB, req *request.OrderProcessingRequest
 // have older updated_at values and are silently skipped.
 var expiredCallbackEnabledFrom = time.Date(2026, 9, 3, 0, 0, 0, 0, time.Local)
 
-// GetPendingCallbackOrders returns the minimal callback scheduling state.
+const callbackRetryMaxDelay = 5 * time.Minute
+
+// CallbackRetryDelay is shared by SQL scheduling and the dispatch-time check.
+func CallbackRetryDelay(attempts int) time.Duration {
+	if attempts <= 0 {
+		return 0
+	}
+	delay := config.GetCallbackRetryBaseDuration()
+	for i := 1; i < attempts; i++ {
+		if delay >= callbackRetryMaxDelay/2 {
+			return callbackRetryMaxDelay
+		}
+		delay *= 2
+	}
+	if delay > callbackRetryMaxDelay {
+		return callbackRetryMaxDelay
+	}
+	return delay
+}
+
+// GetPendingCallbackOrders selects due callbacks before applying the batch
+// limit. Older rows still in backoff must not starve fresh payment callbacks.
 func GetPendingCallbackOrders(maxRetry int, limit int) ([]PendingCallbackOrder, error) {
 	var orders []PendingCallbackOrder
+	now := time.Now()
+	due := dao.Mdb.Where("callback_num = 0")
+	for attempt := 1; attempt <= maxRetry; attempt++ {
+		delay := CallbackRetryDelay(attempt)
+		if delay >= callbackRetryMaxDelay {
+			// All subsequent attempts share the cap; keep the SQL bounded even
+			// when an administrator configures a large retry count.
+			due = due.Or("callback_num >= ? AND updated_at <= ?", attempt, now.Add(-delay))
+			break
+		}
+		due = due.Or("callback_num = ? AND updated_at <= ?", attempt, now.Add(-delay))
+	}
 	query := dao.Mdb.Model(&mdb.Orders{}).
 		Select("trade_id", "callback_num", "callback_confirm", "updated_at").
 		Where("callback_num <= ?", maxRetry).
@@ -377,6 +400,7 @@ func GetPendingCallbackOrders(maxRetry int, limit int) ([]PendingCallbackOrder, 
 		Where("status IN ?", []int{mdb.StatusPaySuccess, mdb.StatusExpired}).
 		Where("updated_at >= ?", expiredCallbackEnabledFrom).
 		Where("notify_url != ''").
+		Where(due).
 		Order("updated_at asc")
 	if limit > 0 {
 		query = query.Limit(limit)
